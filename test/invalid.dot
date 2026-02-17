@@ -1,0 +1,6 @@
+digraph Invalid {
+    /* Missing start node */
+    exit [shape=Msquare]
+    orphan [label="Orphan node"]
+    exit -> orphan
+}

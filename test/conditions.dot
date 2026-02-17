@@ -1,0 +1,16 @@
+digraph Conditions {
+    graph [goal="Test condition evaluation with OR and parentheses"]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    decide [label="Decide", shape=diamond]
+    path_a [label="Path A"]
+    path_b [label="Path B"]
+
+    start -> decide
+    decide -> path_a [condition="outcome=success && context.mode=fast"]
+    decide -> path_b [condition="outcome=success || context.fallback=true"]
+    path_a -> exit
+    path_b -> exit
+}

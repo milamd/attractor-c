@@ -1,0 +1,12 @@
+# Build artifacts
+*.o
+*.a
+/attractor
+attractor-run-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
