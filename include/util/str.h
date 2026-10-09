@@ -9,12 +9,18 @@ typedef struct {
     char  *data;
     size_t len;
     size_t cap;
+    size_t limit;
+    bool failed;  /* sticky; detach returns NULL and frees storage on failure */
 } StrBuf;
 
 void    strbuf_init(StrBuf *sb);
+void    strbuf_init_limit(StrBuf *sb, size_t limit);
 void    strbuf_free(StrBuf *sb);
 void    strbuf_append(StrBuf *sb, const char *s, size_t n);
 void    strbuf_append_cstr(StrBuf *sb, const char *s);
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 3)))
+#endif
 void    strbuf_appendf(StrBuf *sb, const char *fmt, ...);
 char   *strbuf_detach(StrBuf *sb);   /* caller owns the returned string */
 void    strbuf_reset(StrBuf *sb);

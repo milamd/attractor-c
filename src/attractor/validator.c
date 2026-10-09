@@ -1,7 +1,9 @@
 #include "attractor/validator.h"
 #include "attractor/engine.h"
 #include "util/str.h"
+#include "util/mem.h"
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -13,7 +15,7 @@
 void diagnostic_list_init(DiagnosticList *dl) {
     dl->items = NULL;
     dl->count = 0;
-    dl->cap = 0;
+    dl->cap = 0;dl->failed=false;
 }
 
 void diagnostic_list_free(DiagnosticList *dl) {
@@ -34,8 +36,9 @@ void diagnostic_list_add(DiagnosticList *dl, DiagSeverity sev,
                          const char *rule, const char *msg,
                          const char *node_id, const char *fix) {
     if (dl->count >= dl->cap) {
-        dl->cap = dl->cap ? dl->cap * 2 : 16;
-        dl->items = realloc(dl->items, dl->cap * sizeof(Diagnostic));
+        size_t cap=dl->cap?dl->cap*2:16;
+        Diagnostic *items=mem_reallocarray(dl->items,cap,sizeof(*items));
+        if(!items) {dl->failed=true;return;}dl->items=items;dl->cap=cap;
     }
     Diagnostic *d = &dl->items[dl->count++];
     d->severity  = sev;
@@ -52,8 +55,9 @@ static void diagnostic_list_add_edge(DiagnosticList *dl, DiagSeverity sev,
                                      const char *edge_from, const char *edge_to,
                                      const char *fix) {
     if (dl->count >= dl->cap) {
-        dl->cap = dl->cap ? dl->cap * 2 : 16;
-        dl->items = realloc(dl->items, dl->cap * sizeof(Diagnostic));
+        size_t cap=dl->cap?dl->cap*2:16;
+        Diagnostic *items=mem_reallocarray(dl->items,cap,sizeof(*items));
+        if(!items) {dl->failed=true;return;}dl->items=items;dl->cap=cap;
     }
     Diagnostic *d = &dl->items[dl->count++];
     d->severity  = sev;
@@ -66,6 +70,7 @@ static void diagnostic_list_add_edge(DiagnosticList *dl, DiagSeverity sev,
 }
 
 bool diagnostic_list_has_errors(const DiagnosticList *dl) {
+    if(dl->failed) return true;
     for (size_t i = 0; i < dl->count; i++) {
         if (dl->items[i].severity == DIAG_ERROR) return true;
     }
@@ -76,18 +81,8 @@ bool diagnostic_list_has_errors(const DiagnosticList *dl) {
  * Internal helpers
  *==========================================================================*/
 
-static bool is_start_node(const DotNode *n) {
-    if (n->shape && str_eq(n->shape, "Mdiamond")) return true;
-    if (str_eq(n->id, "start") || str_eq(n->id, "Start")) return true;
-    return false;
-}
-
-static bool is_terminal_node(const DotNode *n) {
-    if (n->shape && str_eq(n->shape, "Msquare")) return true;
-    if (str_eq(n->id, "exit") || str_eq(n->id, "end") ||
-        str_eq(n->id, "Exit") || str_eq(n->id, "End")) return true;
-    return false;
-}
+static bool is_start_node(const DotNode *n) {return str_eq(dot_node_role(n),"start");}
+static bool is_terminal_node(const DotNode *n) {return str_eq(dot_node_role(n),"exit");}
 
 /* Return index of start node, or -1 if not found. */
 static int find_start_index(const DotGraph *g) {
@@ -103,31 +98,7 @@ static int find_start_index(const DotGraph *g) {
  * not a recognized structural shape (diamond, hexagon, Mdiamond, Msquare,
  * house, invhouse, etc.).
  */
-static bool is_llm_node(const DotNode *n) {
-    /* Explicit type wins */
-    if (n->type && n->type[0] != '\0') {
-        return str_eq(n->type, "codergen");
-    }
-    /* Structural shapes are never LLM nodes */
-    if (n->shape) {
-        if (str_eq(n->shape, "Mdiamond") || str_eq(n->shape, "Msquare") ||
-            str_eq(n->shape, "diamond")  || str_eq(n->shape, "hexagon") ||
-            str_eq(n->shape, "house")    || str_eq(n->shape, "invhouse") ||
-            str_eq(n->shape, "parallelogram") ||
-            str_eq(n->shape, "doubleoctagon") ||
-            str_eq(n->shape, "tripleoctagon"))
-            return false;
-        /* shape=box is the canonical LLM shape */
-        if (str_eq(n->shape, "box") || str_eq(n->shape, "rect") ||
-            str_eq(n->shape, "rectangle"))
-            return true;
-    }
-    /* No shape, no type: start/exit names are excluded */
-    if (is_start_node(n) || is_terminal_node(n)) return false;
-    /* Default: no shape + no type = codergen */
-    if (!n->shape || n->shape[0] == '\0') return true;
-    return false;
-}
+static bool is_llm_node(const DotNode *n) {return str_eq(dot_node_role(n),"codergen");}
 
 /*============================================================================
  * Rule: start_node
@@ -176,8 +147,9 @@ static void rule_reachability(const DotGraph *g, DiagnosticList *dl) {
     size_t n = g->node_count;
     if (n == 0) return;
 
-    bool *visited = calloc(n, sizeof(bool));
-    size_t *queue = calloc(n, sizeof(size_t));
+    bool *visited = mem_calloc(n, sizeof(bool));
+    size_t *queue = mem_calloc(n, sizeof(size_t));
+    if(!visited || !queue) {free(visited);free(queue);dl->failed=true;return;}
     size_t head = 0, tail = 0;
 
     visited[(size_t)start] = true;
@@ -186,12 +158,11 @@ static void rule_reachability(const DotGraph *g, DiagnosticList *dl) {
     /* BFS */
     while (head < tail) {
         size_t cur = queue[head++];
-        const DotEdge *out[256];
-        size_t out_count = dot_outgoing_edges(g, g->nodes[cur].id, out, 256);
-        for (size_t e = 0; e < out_count; e++) {
+        for(size_t e=0;e<g->edge_count;e++) {
+            if(!str_eq(g->edges[e].from,g->nodes[cur].id)) continue;
             /* Find target node index */
             for (size_t j = 0; j < n; j++) {
-                if (str_eq(g->nodes[j].id, out[e]->to) && !visited[j]) {
+                if (str_eq(g->nodes[j].id, g->edges[e].to) && !visited[j]) {
                     visited[j] = true;
                     queue[tail++] = j;
                 }
@@ -250,8 +221,7 @@ static void rule_edge_target_exists(const DotGraph *g, DiagnosticList *dl) {
 static void rule_start_no_incoming(const DotGraph *g, DiagnosticList *dl) {
     for (size_t i = 0; i < g->node_count; i++) {
         if (!is_start_node(&g->nodes[i])) continue;
-        const DotEdge *inc[256];
-        size_t inc_count = dot_incoming_edges(g, g->nodes[i].id, inc, 256);
+        size_t inc_count = dot_incoming_edges(g, g->nodes[i].id, NULL, 0);
         if (inc_count > 0) {
             StrBuf msg;
             strbuf_init(&msg);
@@ -272,8 +242,7 @@ static void rule_start_no_incoming(const DotGraph *g, DiagnosticList *dl) {
 static void rule_exit_no_outgoing(const DotGraph *g, DiagnosticList *dl) {
     for (size_t i = 0; i < g->node_count; i++) {
         if (!is_terminal_node(&g->nodes[i])) continue;
-        const DotEdge *out[256];
-        size_t out_count = dot_outgoing_edges(g, g->nodes[i].id, out, 256);
+        size_t out_count = dot_outgoing_edges(g, g->nodes[i].id, NULL, 0);
         if (out_count > 0) {
             StrBuf msg;
             strbuf_init(&msg);
@@ -296,79 +265,11 @@ static void rule_exit_no_outgoing(const DotGraph *g, DiagnosticList *dl) {
  * also accepted.
  *==========================================================================*/
 
-static bool validate_single_clause(const char *start, size_t len) {
-    char *clause = str_ndup(start, len);
-    char *trimmed = str_trim(clause);
-
-    if (trimmed[0] == '\0') { free(clause); return false; }
-
-    /* A bare key (no operator) is valid: means truthy check */
-    char *neq = strstr(trimmed, "!=");
-    char *eq  = strchr(trimmed, '=');
-    if (!eq) {
-        /* Bare key - valid if non-empty */
-        free(clause);
-        return true;
-    }
-
-    /* Key is everything before the operator */
-    size_t key_len;
-    if (neq && neq < eq) {
-        key_len = (size_t)(neq - trimmed);
-    } else if (eq > trimmed && *(eq - 1) == '!') {
-        key_len = (size_t)(eq - 1 - trimmed);
-    } else {
-        key_len = (size_t)(eq - trimmed);
-    }
-
-    char *key = str_ndup(trimmed, key_len);
-    char *tkey = str_trim(key);
-    bool valid = (tkey[0] != '\0');
-    free(key);
-    free(clause);
-    return valid;
-}
-
-static bool validate_condition_expr(const char *cond) {
-    if (!cond || cond[0] == '\0') return true;
-
-    /* Walk the expression, stripping parens and logical operators,
-     * validating each leaf clause. */
-    const char *p = cond;
-    int paren_depth = 0;
-
-    while (*p) {
-        /* Skip whitespace */
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-
-        if (*p == '(') { paren_depth++; p++; continue; }
-        if (*p == ')') {
-            if (paren_depth <= 0) return false; /* unmatched */
-            paren_depth--; p++; continue;
-        }
-        if (*p == '&' && *(p+1) == '&') { p += 2; continue; }
-        if (*p == '|' && *(p+1) == '|') { p += 2; continue; }
-
-        /* Read a clause: stop at &&, ||, ), or end */
-        const char *clause_start = p;
-        while (*p && *p != ')' &&
-               !(*p == '&' && *(p+1) == '&') &&
-               !(*p == '|' && *(p+1) == '|'))
-            p++;
-
-        if (!validate_single_clause(clause_start, (size_t)(p - clause_start)))
-            return false;
-    }
-
-    return paren_depth == 0;
-}
-
 static void rule_condition_syntax(const DotGraph *g, DiagnosticList *dl) {
     for (size_t i = 0; i < g->edge_count; i++) {
         const DotEdge *e = &g->edges[i];
         if (!e->condition || e->condition[0] == '\0') continue;
-        if (!validate_condition_expr(e->condition)) {
+        if (!condition_validate(e->condition)) {
             StrBuf msg;
             strbuf_init(&msg);
             strbuf_appendf(&msg,
@@ -393,7 +294,7 @@ static const char *known_types[] = {
     NULL
 };
 
-static void rule_type_known(const DotGraph *g, DiagnosticList *dl) {
+static void rule_type_known(const DotGraph *g, DiagnosticList *dl, HandlerTypeKnown known, void *userdata) {
     for (size_t i = 0; i < g->node_count; i++) {
         const DotNode *n = &g->nodes[i];
         if (!n->type || n->type[0] == '\0') continue;
@@ -401,12 +302,13 @@ static void rule_type_known(const DotGraph *g, DiagnosticList *dl) {
         for (const char **t = known_types; *t; t++) {
             if (str_eq(n->type, *t)) { found = true; break; }
         }
+        if(!found && known) found=known(n->type,userdata);
         if (!found) {
             StrBuf msg;
             strbuf_init(&msg);
             strbuf_appendf(&msg, "Node \"%s\" has unknown type \"%s\".",
                            n->id, n->type);
-            diagnostic_list_add(dl, DIAG_WARNING, "type_known", msg.data,
+            diagnostic_list_add(dl, DIAG_ERROR, "type_known", msg.data,
                                 n->id,
                                 "Use one of: start, exit, codergen, wait.human, "
                                 "conditional, parallel, parallel.fan_in, tool, "
@@ -600,7 +502,8 @@ static void rule_stylesheet_syntax(const DotGraph *g, DiagnosticList *dl) {
  * validate_graph
  *==========================================================================*/
 
-DiagnosticList validate_graph(const DotGraph *g) {
+DiagnosticList validate_graph_with_handlers(const DotGraph *g,HandlerTypeKnown known,void *userdata) {
+    unsigned long allocations=mem_failure_count();
     DiagnosticList dl;
     diagnostic_list_init(&dl);
 
@@ -610,6 +513,24 @@ DiagnosticList validate_graph(const DotGraph *g) {
         return dl;
     }
 
+    if(g->failed) diagnostic_list_add(&dl,DIAG_ERROR,"transform","Graph transformation failed",NULL,NULL);
+    if(g->default_max_retry<0 || g->default_max_retry>1000) diagnostic_list_add(&dl,DIAG_ERROR,"retry_budget","Graph retry budget must be 0-1000",NULL,NULL);
+    for(size_t i=0;i<g->node_count;i++) {
+        const char *retry=dot_node_attr(&g->nodes[i],"max_retries",NULL);
+        if(retry) {char *end;errno=0;long limit=strtol(retry,&end,10);if(end==retry || *end || errno==ERANGE || limit<0 || limit>1000) diagnostic_list_add(&dl,DIAG_ERROR,"retry_budget","Node retry budget must be 0-1000",g->nodes[i].id,NULL);}
+        const char *id=g->nodes[i].id;
+        if(!id || !*id || strlen(id)>100) diagnostic_list_add(&dl,DIAG_ERROR,"node_id","Node IDs must contain 1-100 bytes",id,NULL);
+        else for(const unsigned char *p=(const unsigned char *)id;*p;p++) if(*p<32 || *p==127) {
+            diagnostic_list_add(&dl,DIAG_ERROR,"node_id","Control characters in node ID",id,NULL);break;
+        }
+        if(str_eq(dot_node_role(&g->nodes[i]),"parallel")) {
+            char *error=NULL;if(!dot_parallel_join(g,&g->nodes[i],&error)) diagnostic_list_add(&dl,DIAG_ERROR,"parallel_region",error,id,NULL);free(error);
+            const char *join=dot_node_attr(&g->nodes[i],"join_policy","wait_all"),*policy=dot_node_attr(&g->nodes[i],"error_policy","fail_fast");
+            if(!str_eq(join,"wait_all") && !str_eq(join,"first_success") && !str_eq(join,"quorum")) diagnostic_list_add(&dl,DIAG_ERROR,"parallel_policy","Unsupported join policy",id,NULL);
+            if(!str_eq(policy,"continue") && !str_eq(policy,"fail_fast")) diagnostic_list_add(&dl,DIAG_ERROR,"parallel_policy","Unsupported error policy",id,NULL);
+        }
+        if(str_eq(dot_node_role(&g->nodes[i]),"unsupported")) diagnostic_list_add(&dl,DIAG_ERROR,"type_known","Unsupported shape without explicit handler type",id,NULL);
+    }
     /* ERROR rules */
     rule_start_node(g, &dl);
     rule_terminal_node(g, &dl);
@@ -621,12 +542,13 @@ DiagnosticList validate_graph(const DotGraph *g) {
     rule_stylesheet_syntax(g, &dl);
 
     /* WARNING rules */
-    rule_type_known(g, &dl);
+    rule_type_known(g, &dl,known,userdata);
     rule_fidelity_valid(g, &dl);
     rule_retry_target_exists(g, &dl);
     rule_goal_gate_has_retry(g, &dl);
     rule_prompt_on_llm_nodes(g, &dl);
 
+    if(mem_failure_count()!=allocations) dl.failed=true;
     return dl;
 }
 
@@ -634,8 +556,10 @@ DiagnosticList validate_graph(const DotGraph *g) {
  * validate_or_raise
  *==========================================================================*/
 
-bool validate_or_raise(const DotGraph *g, char **err_msg) {
-    DiagnosticList dl = validate_graph(g);
+DiagnosticList validate_graph(const DotGraph *g) {return validate_graph_with_handlers(g,NULL,NULL);}
+bool validate_or_raise(const DotGraph *g,char **err_msg) {return validate_or_raise_with_handlers(g,NULL,NULL,err_msg);}
+bool validate_or_raise_with_handlers(const DotGraph *g,HandlerTypeKnown known,void *userdata,char **err_msg) {
+    DiagnosticList dl = validate_graph_with_handlers(g,known,userdata);
 
     if (!diagnostic_list_has_errors(&dl)) {
         diagnostic_list_free(&dl);

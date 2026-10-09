@@ -1,12 +1,15 @@
 #include "llm/types.h"
 #include "util/str.h"
+#include "util/mem.h"
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 /*--- Free helpers ---*/
 
 void content_part_free(ContentPart *p) {
     if (!p) return;
+    free(p->provider_metadata_json);
     free(p->text);
     if (p->image) {
         free(p->image->url);
@@ -108,6 +111,7 @@ void llm_error_free(LlmError *e) {
     free(e->message);
     free(e->provider);
     free(e->raw_json);
+    memset(e,0,sizeof(*e));
 }
 
 void stream_event_free(StreamEvent *ev) {
@@ -122,57 +126,48 @@ void stream_event_free(StreamEvent *ev) {
     free(ev->raw_json);
 }
 
+static int token_sum(int a,int b) {
+    if(a<0) a=0;if(b<0) b=0;return b>INT_MAX-a?INT_MAX:a+b;
+}
 Usage usage_add(Usage a, Usage b) {
     Usage r;
-    r.input_tokens = a.input_tokens + b.input_tokens;
-    r.output_tokens = a.output_tokens + b.output_tokens;
-    r.total_tokens = a.total_tokens + b.total_tokens;
+    r.input_tokens = token_sum(a.input_tokens,b.input_tokens);
+    r.output_tokens = token_sum(a.output_tokens,b.output_tokens);
+    r.total_tokens = token_sum(a.total_tokens,b.total_tokens);
     r.reasoning_tokens = (a.reasoning_tokens >= 0 || b.reasoning_tokens >= 0)
-        ? (a.reasoning_tokens > 0 ? a.reasoning_tokens : 0) + (b.reasoning_tokens > 0 ? b.reasoning_tokens : 0)
+        ? token_sum(a.reasoning_tokens,b.reasoning_tokens)
         : -1;
     r.cache_read_tokens = (a.cache_read_tokens >= 0 || b.cache_read_tokens >= 0)
-        ? (a.cache_read_tokens > 0 ? a.cache_read_tokens : 0) + (b.cache_read_tokens > 0 ? b.cache_read_tokens : 0)
+        ? token_sum(a.cache_read_tokens,b.cache_read_tokens)
         : -1;
     r.cache_write_tokens = (a.cache_write_tokens >= 0 || b.cache_write_tokens >= 0)
-        ? (a.cache_write_tokens > 0 ? a.cache_write_tokens : 0) + (b.cache_write_tokens > 0 ? b.cache_write_tokens : 0)
+        ? token_sum(a.cache_write_tokens,b.cache_write_tokens)
         : -1;
     return r;
 }
 
 /*--- Message constructors ---*/
 
-static Message *msg_new(Role role, const char *text) {
-    Message *m = calloc(1, sizeof(Message));
-    m->role = role;
-    if (text) {
-        m->parts = malloc(sizeof(ContentPart *));
-        ContentPart *p = calloc(1, sizeof(ContentPart));
-        p->kind = CONTENT_TEXT;
-        p->text = str_dup(text);
-        m->parts[0] = p;
-        m->part_count = 1;
-    }
-    return m;
+static Message *msg_new(Role role,const char *text) {
+    Message *m=mem_calloc(1,sizeof(*m));if(!m) return NULL;m->role=role;
+    if(text) {
+        m->parts=mem_calloc(1,sizeof(*m->parts));if(!m->parts) goto fail;
+        ContentPart *p=mem_calloc(1,sizeof(*p));if(!p) goto fail;
+        m->parts[0]=p;m->part_count=1;p->kind=CONTENT_TEXT;p->text=str_dup(text);if(!p->text) goto fail;
+    }return m;
+fail:message_free(m);return NULL;
 }
-
-Message *message_system(const char *text)    { return msg_new(ROLE_SYSTEM, text); }
-Message *message_user(const char *text)      { return msg_new(ROLE_USER, text); }
-Message *message_assistant(const char *text)  { return msg_new(ROLE_ASSISTANT, text); }
-
-Message *message_tool_result(const char *call_id, const char *content, bool is_error) {
-    Message *m = calloc(1, sizeof(Message));
-    m->role = ROLE_TOOL;
-    m->tool_call_id = str_dup(call_id);
-    ContentPart *p = calloc(1, sizeof(ContentPart));
-    p->kind = CONTENT_TOOL_RESULT;
-    p->tool_result = calloc(1, sizeof(ToolResultData));
-    p->tool_result->tool_call_id = str_dup(call_id);
-    p->tool_result->content = str_dup(content);
-    p->tool_result->is_error = is_error;
-    m->parts = malloc(sizeof(ContentPart *));
-    m->parts[0] = p;
-    m->part_count = 1;
-    return m;
+Message *message_system(const char *text) {return msg_new(ROLE_SYSTEM,text);}
+Message *message_user(const char *text) {return msg_new(ROLE_USER,text);}
+Message *message_assistant(const char *text) {return msg_new(ROLE_ASSISTANT,text);}
+Message *message_tool_result(const char *id,const char *content,bool error) {
+    Message *m=msg_new(ROLE_TOOL,NULL);if(!m) return NULL;
+    m->tool_call_id=str_dup(id);m->parts=mem_calloc(1,sizeof(*m->parts));if(!m->parts) goto fail;
+    ContentPart *p=mem_calloc(1,sizeof(*p));if(!p) goto fail;m->parts[0]=p;m->part_count=1;p->kind=CONTENT_TOOL_RESULT;
+    p->tool_result=mem_calloc(1,sizeof(*p->tool_result));if(!p->tool_result) goto fail;
+    p->tool_result->tool_call_id=str_dup(id);p->tool_result->content=str_dup(content);p->tool_result->is_error=error;
+    if((id && (!m->tool_call_id || !p->tool_result->tool_call_id)) || (content && !p->tool_result->content)) goto fail;return m;
+fail:message_free(m);return NULL;
 }
 
 char *message_text(const Message *m) {
@@ -184,4 +179,43 @@ char *message_text(const Message *m) {
             strbuf_append_cstr(&sb, m->parts[i]->text);
     }
     return strbuf_detach(&sb);
+}
+
+/* Every populated content field is cloned, including image and reasoning metadata. */
+Message *message_clone(const Message *source) {
+    if(!source) return NULL;
+    Message *m=mem_calloc(1,sizeof(*m));if(!m) return NULL;
+    m->role=source->role;
+    m->name=str_dup(source->name);m->tool_call_id=str_dup(source->tool_call_id);
+    if((source->name && !m->name)||(source->tool_call_id && !m->tool_call_id)) goto fail;
+    m->parts=mem_calloc(source->part_count,sizeof(*m->parts));if(!m->parts) goto fail;
+    for(size_t i=0;i<source->part_count;i++) {
+        const ContentPart *s=source->parts[i];if(!s) goto fail;
+        ContentPart *d=mem_calloc(1,sizeof(*d));if(!d) goto fail;
+        m->parts[m->part_count++]=d;d->kind=s->kind;
+#define COPY_STRING(dst,src) do { (dst)=str_dup(src);if((src) && !(dst)) goto fail; } while(0)
+#define NEW_FIELD(field) do {d->field=mem_calloc(1,sizeof(*d->field));if(!d->field) goto fail;} while(0)
+        COPY_STRING(d->provider_metadata_json,s->provider_metadata_json);
+        COPY_STRING(d->text,s->text);
+        if(s->image) {
+            NEW_FIELD(image);COPY_STRING(d->image->url,s->image->url);COPY_STRING(d->image->data_base64,s->image->data_base64);
+            COPY_STRING(d->image->media_type,s->image->media_type);COPY_STRING(d->image->detail,s->image->detail);
+        }
+        if(s->tool_call) {
+            NEW_FIELD(tool_call);COPY_STRING(d->tool_call->id,s->tool_call->id);COPY_STRING(d->tool_call->name,s->tool_call->name);
+            COPY_STRING(d->tool_call->arguments_json,s->tool_call->arguments_json);
+        }
+        if(s->tool_result) {
+            NEW_FIELD(tool_result);COPY_STRING(d->tool_result->tool_call_id,s->tool_result->tool_call_id);
+            COPY_STRING(d->tool_result->content,s->tool_result->content);d->tool_result->is_error=s->tool_result->is_error;
+        }
+        if(s->thinking) {
+            NEW_FIELD(thinking);COPY_STRING(d->thinking->text,s->thinking->text);COPY_STRING(d->thinking->signature,s->thinking->signature);
+            d->thinking->redacted=s->thinking->redacted;
+        }
+#undef COPY_STRING
+#undef NEW_FIELD
+    }
+    return m;
+fail:message_free(m);return NULL;
 }

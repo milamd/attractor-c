@@ -44,14 +44,17 @@ typedef struct {
     char       **values;
     size_t       count;
     size_t       cap;
+    size_t       byte_count; /* aggregate key/value bytes, bounded to input limit */
     char       **logs;
     size_t       log_count;
     size_t       log_cap;
+    bool         failed;
 } PipelineContext;
 
 void        ctx_init(PipelineContext *c);
 void        ctx_free(PipelineContext *c);
 void        ctx_set(PipelineContext *c, const char *key, const char *value);
+/* Borrowed until replacement of that key or ctx_free; aliases are valid ctx_set inputs. */
 const char *ctx_get(const PipelineContext *c, const char *key, const char *def);
 void        ctx_apply_updates(PipelineContext *c, const Outcome *o);
 PipelineContext *ctx_clone(const PipelineContext *c);
@@ -61,14 +64,22 @@ void        ctx_append_log(PipelineContext *c, const char *entry);
  * Checkpoint
  *==========================================================================*/
 
+/* Version 2. Initialize to zero before load; load replaces state only after
+ * complete validation. All pointers/context are owned and released by free. */
 typedef struct {
-    char           *current_node;
-    char          **completed_nodes;
-    size_t          completed_count;
+    unsigned version;
+    char *graph_identity;
+    char *run_id;
+    char *next_node; /* committed transition, never reconstructed from artifacts */
+    char *pending_node; /* external effect may have happened; explicit recovery required */
+    bool complete;
+    Outcome final_outcome;
+    JsonValue *history; /* append-only attempts */
+    JsonValue *latest;  /* latest outcome keyed by node ID */
     PipelineContext context;
 } Checkpoint;
 
-void checkpoint_save(const Checkpoint *cp, const char *path);
+bool checkpoint_save(const Checkpoint *cp, const char *path);
 bool checkpoint_load(Checkpoint *cp, const char *path);
 void checkpoint_free(Checkpoint *cp);
 
@@ -76,6 +87,7 @@ void checkpoint_free(Checkpoint *cp);
  * Condition Expression Evaluator
  *==========================================================================*/
 
+bool condition_validate(const char *condition);
 bool evaluate_condition(const char *condition, const Outcome *outcome,
                         const PipelineContext *ctx);
 
@@ -98,6 +110,7 @@ typedef struct {
     size_t    count;
     size_t    cap;
     Handler  *default_handler;
+    bool      failed;
 } HandlerRegistry;
 
 void     handler_registry_init(HandlerRegistry *reg);
@@ -114,6 +127,7 @@ typedef struct CodergenBackend CodergenBackend;
 struct CodergenBackend {
     void *impl;
     /* Returns a result string or NULL on error. Caller frees. */
+    /* Backend returns owned text bounded to ATTRACTOR_OUTPUT_LIMIT. */
     char *(*run)(CodergenBackend *self, const DotNode *node,
                  const char *prompt, const PipelineContext *ctx);
 };
@@ -140,9 +154,15 @@ typedef struct {
     QuestionOption *options;
     size_t          option_count;
     char           *stage;
+    int             timeout_ms; /* 0 means no configured timeout */
 } Question;
 
+typedef enum {
+    ANSWER_INVALID, ANSWER_SELECTION, ANSWER_TIMEOUT, ANSWER_CANCELLED, ANSWER_EOF
+} AnswerKind;
+
 typedef struct {
+    AnswerKind      kind;
     char           *value;
     char           *text;
     int             option_index;   /* -1 if freeform */
@@ -183,25 +203,36 @@ typedef struct {
     int               attempt;
 } PipelineEvent;
 
+/* Event fields are borrowed until the callback returns. */
 typedef void (*PipelineEventCallback)(const PipelineEvent *ev, void *userdata);
 
 /*============================================================================
  * Pipeline Runner
  *==========================================================================*/
 
+typedef struct ExecutionEnv ExecutionEnv;
+
 typedef struct {
-    DotGraph         *graph;
+    DotGraph         *graph; /* borrowed; caller releases after runner */
     HandlerRegistry   handler_reg;
     CodergenBackend  *backend;          /* may be NULL for simulation */
-    Interviewer      *interviewer;
+    Interviewer      *interviewer; /* owned; set_interviewer transfers ownership */
+    ExecutionEnv     *execution_env; /* borrowed; inherited by branches/children */
+    const bool       *cancel; /* borrowed, owner-thread; checked between stages */
     char             *logs_root;
     PipelineEventCallback event_cb;
     void             *event_userdata;
+    size_t            max_iterations; /* default 10000 */
+    unsigned          child_depth;
+    unsigned          max_child_depth; /* default 8 */
+    bool              owns_interviewer;
+    Checkpoint       *active_checkpoint; /* internal borrowed execution state */
 } PipelineRunner;
 
 /* Create a runner for a parsed & validated graph */
 PipelineRunner *pipeline_runner_new(DotGraph *graph, const char *logs_root);
 void            pipeline_runner_free(PipelineRunner *r);
+void            pipeline_runner_set_execution_env(PipelineRunner *r, ExecutionEnv *env);
 void            pipeline_runner_set_backend(PipelineRunner *r, CodergenBackend *b);
 void            pipeline_runner_set_interviewer(PipelineRunner *r, Interviewer *iv);
 void            pipeline_runner_on_event(PipelineRunner *r, PipelineEventCallback cb, void *ud);

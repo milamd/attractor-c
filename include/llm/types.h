@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Message/response constructors and clones return owned trees. Their destructors
+ * release all populated pointer fields. Do not shallow-copy owned trees.
+ * LlmRequest fields are borrowed by completion/generation. */
+
 /*============================================================================
  * Enums
  *==========================================================================*/
@@ -96,6 +100,7 @@ typedef struct {
 } ImageData;
 
 typedef struct {
+    char           *provider_metadata_json; /* owned opaque Gemini part for replay */
     ContentKind     kind;
     char           *text;           /* for TEXT */
     ImageData      *image;          /* for IMAGE */
@@ -176,6 +181,7 @@ typedef struct {
     size_t           stop_count;
     ReasoningEffort  reasoning_effort;
     char            *provider_options_json;  /* raw JSON escape hatch */
+    const bool      *cancel; /* borrowed owner-thread cancellation */
 } LlmRequest;
 
 typedef struct {
@@ -265,4 +271,5 @@ Message    *message_tool_result(const char *call_id, const char *content, bool i
 /* Extract text from a message */
 char       *message_text(const Message *m);
 
+Message *message_clone(const Message *source);
 #endif

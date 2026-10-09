@@ -1,6 +1,8 @@
 #include "agent/agent.h"
 #include "util/str.h"
 #include "util/json.h"
+#include "util/io.h"
+#include "util/mem.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -11,6 +13,11 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <fnmatch.h>
+#include <regex.h>
+#include <errno.h>
+#include <math.h>
+#include <limits.h>
+#include <fcntl.h>
 #include <uuid/uuid.h>
 
 /*============================================================================
@@ -20,7 +27,8 @@
 static char *gen_uuid(void) {
     uuid_t u;
     uuid_generate(u);
-    char *s = malloc(37);
+    char *s = mem_alloc(37);
+    if(!s) return NULL;
     uuid_unparse_lower(u, s);
     return s;
 }
@@ -57,181 +65,110 @@ static void emit(AgentSession *s, AgentEventKind kind, const char *data,
 
 typedef struct {
     char *working_dir;
+    bool contained;
 } LocalEnvState;
 
-static char *local_read_file(ExecutionEnv *self, const char *path, int offset, int limit) {
-    (void)self;
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-
-    StrBuf sb;
-    strbuf_init(&sb);
-    char line[4096];
-    int linenum = 0;
-    int lines_read = 0;
-    int start = offset > 0 ? offset : 1;
-    int max_lines = limit > 0 ? limit : 2000;
-
-    while (fgets(line, sizeof(line), f)) {
-        linenum++;
-        if (linenum < start) continue;
-        if (lines_read >= max_lines) break;
-        strbuf_appendf(&sb, "%4d\t%s", linenum, line);
-        lines_read++;
+static char *local_read_raw(ExecutionEnv *self,const char *path);
+static char *local_read_file(ExecutionEnv *self,const char *path,int offset,int limit) {
+    char *raw=local_read_raw(self,path);if(!raw) return NULL;
+    StrBuf b;strbuf_init_limit(&b,ATTRACTOR_OUTPUT_LIMIT);
+    size_t start=offset>0?(size_t)offset:1,maximum=limit>0?(size_t)limit:2000,line=1,printed=0;
+    for(char *cursor=raw;*cursor && printed<maximum;line++) {
+        char *end=strchr(cursor,'\n');size_t length=end?(size_t)(end-cursor)+1:strlen(cursor);
+        if(line>=start) {strbuf_appendf(&b,"%4zu\t",line);strbuf_append(&b,cursor,length);printed++;}
+        cursor+=length;
     }
-    fclose(f);
-    return strbuf_detach(&sb);
+    free(raw);return strbuf_detach(&b);
 }
 
-static bool local_write_file(ExecutionEnv *self, const char *path, const char *content) {
-    (void)self;
-    /* Create parent directories */
-    char *dir = str_dup(path);
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        /* Recursively create dirs */
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dir);
-        if (system(cmd) != 0) { /* ignore errors */ }
-    }
-    free(dir);
-
-    FILE *f = fopen(path, "w");
-    if (!f) return false;
-    fputs(content ? content : "", f);
-    fclose(f);
-    return true;
+static char *local_read_raw(ExecutionEnv *self,const char *path) {
+    LocalEnvState *st=self->impl;
+    int fd=io_open_workspace(st->working_dir,path,O_RDONLY,0,st->contained);if(fd<0) return NULL;
+    FILE *f=fdopen(fd,"rb");if(!f) {close(fd);return NULL;}
+    size_t length=0;char *data=io_read_stream(f,ATTRACTOR_INPUT_LIMIT,&length);
+    if(fclose(f)!=0 || (data && memchr(data,0,length))) {free(data);return NULL;}return data;
+}
+static bool local_write_file(ExecutionEnv *self,const char *path,const char *content) {
+    LocalEnvState *st=self->impl;
+    int fd=io_open_workspace(st->working_dir,path,O_WRONLY|O_CREAT|O_TRUNC,0600,st->contained);if(fd<0) return false;
+    FILE *f=fdopen(fd,"w");if(!f) {close(fd);return false;}
+    bool ok=fputs(content?content:"",f)>=0;
+    if(fclose(f)!=0) ok=false;return ok;
+}
+static bool local_file_exists(ExecutionEnv *self,const char *path) {
+    LocalEnvState *st=self->impl;
+    int fd=io_open_workspace(st->working_dir,path,O_RDONLY,0,st->contained);if(fd<0) return false;close(fd);return true;
 }
 
-static bool local_file_exists(ExecutionEnv *self, const char *path) {
-    (void)self;
-    return access(path, F_OK) == 0;
+static ExecResult *local_exec_command(ExecutionEnv *self,const char *cmd,int timeout_ms,const char *working_dir) {
+    LocalEnvState *st=self->impl;StrBuf path;strbuf_init(&path);
+    if(working_dir && working_dir[0]=='/') strbuf_append_cstr(&path,working_dir);
+    else if(working_dir) strbuf_appendf(&path,"%s/%s",st->working_dir,working_dir);
+    else strbuf_append_cstr(&path,st->working_dir);
+    char *directory=strbuf_detach(&path);
+    const char *argv[]={"/bin/sh","-c",cmd,NULL};
+    ExecResult *result=directory?process_run(&(ProcessOptions){.argv=argv,.working_dir=directory,.timeout_ms=timeout_ms,.cancel=self->cancel,.extra_env=self->extra_env}):NULL;
+    free(directory);return result;
 }
-
-static ExecResult *local_exec_command(ExecutionEnv *self, const char *cmd,
-                                       int timeout_ms, const char *working_dir) {
-    LocalEnvState *st = self->impl;
-    ExecResult *r = calloc(1, sizeof(ExecResult));
-
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        r->exit_code = -1;
-        r->stdout_buf = str_dup("Failed to create pipe");
-        return r;
-    }
-
-    struct timeval start_tv;
-    gettimeofday(&start_tv, NULL);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Child */
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        /* Set process group for killability */
-        setpgid(0, 0);
-
-        const char *wd = working_dir ? working_dir : st->working_dir;
-        if (wd) chdir(wd);
-
-        /* Filter sensitive env vars */
-        unsetenv("ANTHROPIC_API_KEY");
-        unsetenv("OPENAI_API_KEY");
-        unsetenv("GEMINI_API_KEY");
-        unsetenv("GOOGLE_API_KEY");
-
-        execl("/bin/bash", "bash", "-c", cmd, NULL);
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-
-    /* Read output with timeout */
-    StrBuf output;
-    strbuf_init(&output);
-    char buf[4096];
-    ssize_t n;
-
-    /* Simple timeout: use alarm-style approach */
-    if (timeout_ms <= 0) timeout_ms = 10000;
-
-    /* Non-blocking read with timeout */
-    fd_set fds;
-    struct timeval tv;
-    bool timed_out = false;
-
-    while (1) {
-        FD_ZERO(&fds);
-        FD_SET(pipefd[0], &fds);
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-        int sel = select(pipefd[0] + 1, &fds, NULL, NULL, &tv);
-        if (sel <= 0) {
-            if (sel == 0) timed_out = true;
-            break;
+typedef struct {
+    const char *pattern,*filter;regex_t regex;bool grep;size_t visited,found,maximum;StrBuf output;
+} Search;
+static bool search_fd(Search *search,int fd,const char *name,unsigned depth) {
+    if(depth>64 || ++search->visited>10000) return false;
+    struct stat st;if(fstat(fd,&st)!=0) return false;
+    if(S_ISDIR(st.st_mode)) {
+        int copy=dup(fd);if(copy<0) return false;DIR *dir=fdopendir(copy);if(!dir) {close(copy);return false;}
+        bool ok=true;struct dirent *entry;
+        while(search->found<search->maximum) {
+            errno=0;entry=readdir(dir);if(!entry) {if(errno) ok=false;break;}
+            if(str_eq(entry->d_name,".") || str_eq(entry->d_name,"..")) continue;
+            struct stat child_stat;
+            if(fstatat(fd,entry->d_name,&child_stat,AT_SYMLINK_NOFOLLOW)!=0) {ok=false;break;}
+            if(!S_ISDIR(child_stat.st_mode) && !S_ISREG(child_stat.st_mode)) continue;
+            int child=openat(fd,entry->d_name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+            StrBuf path;strbuf_init(&path);strbuf_appendf(&path,"%s/%s",name,entry->d_name);char *label=strbuf_detach(&path);
+            if(child<0 || !label || !search_fd(search,child,label,depth+1)) ok=false;
+            if(child>=0) close(child);free(label);if(!ok) break;
         }
-        n = read(pipefd[0], buf, sizeof(buf) - 1);
-        if (n <= 0) break;
-        strbuf_append(&output, buf, (size_t)n);
+        if(closedir(dir)!=0) ok=false;return ok;
     }
-    close(pipefd[0]);
-
-    if (timed_out) {
-        kill(-pid, SIGTERM);
-        usleep(2000000); /* 2 seconds */
-        kill(-pid, SIGKILL);
-        r->timed_out = true;
+    if(!S_ISREG(st.st_mode)) return true;
+    const char *base=strrchr(name,'/');base=base?base+1:name;
+    if(search->filter && fnmatch(search->filter,base,0)!=0) return true;
+    if(!search->grep) {
+        if(fnmatch(search->pattern,strchr(search->pattern,'/')?name:base,0)==0) {strbuf_appendf(&search->output,"%s\n",name);search->found++;}
+        return !search->output.failed;
     }
-
-    int status;
-    waitpid(pid, &status, 0);
-    r->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    r->stdout_buf = strbuf_detach(&output);
-
-    struct timeval end_tv;
-    gettimeofday(&end_tv, NULL);
-    r->duration_ms = (int)((end_tv.tv_sec - start_tv.tv_sec) * 1000 +
-                           (end_tv.tv_usec - start_tv.tv_usec) / 1000);
-
-    return r;
+    int copy=dup(fd);if(copy<0) return false;FILE *file=fdopen(copy,"rb");if(!file) {close(copy);return false;}
+    size_t length=0;char *raw=io_read_stream(file,ATTRACTOR_INPUT_LIMIT,&length);bool ok=fclose(file)==0 && raw;
+    if(!ok) {free(raw);return false;}
+    if(memchr(raw,0,length)) {free(raw);return true;} /* Binary files have no text matches. */
+    size_t line=1;
+    for(char *cursor=raw;*cursor && search->found<search->maximum;line++) {
+        char *end=strchr(cursor,'\n');if(end) *end=0;
+        int rc=regexec(&search->regex,cursor,0,NULL,0);
+        if(rc==0) {strbuf_appendf(&search->output,"%s:%zu:%s\n",name,line,cursor);search->found++;}
+        else if(rc!=REG_NOMATCH) {ok=false;break;}
+        if(!end) break;cursor=end+1;
+    }
+    free(raw);return ok && !search->output.failed;
 }
-
-static char *local_grep(ExecutionEnv *self, const char *pattern, const char *path,
-                        const char *glob_filter, bool case_insensitive, int max_results) {
-    (void)glob_filter;
-    StrBuf cmd;
-    strbuf_init(&cmd);
-    strbuf_appendf(&cmd, "grep -rn %s", case_insensitive ? "-i " : "");
-    if (max_results > 0) strbuf_appendf(&cmd, "-m %d ", max_results);
-    strbuf_appendf(&cmd, "-- '%s' '%s' 2>/dev/null", pattern, path ? path : ".");
-
-    ExecResult *r = local_exec_command(self, cmd.data, 10000, NULL);
-    strbuf_free(&cmd);
-    char *result = r->stdout_buf;
-    r->stdout_buf = NULL;
-    exec_result_free(r);
-    return result;
+static char *local_search(ExecutionEnv *self,const char *pattern,const char *path,const char *filter,bool ci,int maximum,bool grep) {
+    if(!pattern) return NULL;LocalEnvState *st=self->impl;
+    Search search={.pattern=pattern,.filter=filter,.grep=grep,.maximum=maximum>0?(size_t)maximum:500};
+    if(search.maximum>10000) search.maximum=10000;
+    if(grep && regcomp(&search.regex,pattern,REG_NOSUB|(ci?REG_ICASE:0))!=0) return NULL;
+    strbuf_init_limit(&search.output,ATTRACTOR_OUTPUT_LIMIT);
+    int fd=io_open_workspace(st->working_dir,path?path:".",O_RDONLY|O_NONBLOCK,0,st->contained);
+    bool ok=fd>=0 && search_fd(&search,fd,path?path:".",0);
+    if(fd>=0) close(fd);if(grep) regfree(&search.regex);
+    if(!ok) {strbuf_free(&search.output);return NULL;}return strbuf_detach(&search.output);
 }
-
-static char *local_glob_fn(ExecutionEnv *self, const char *pattern, const char *path) {
-    StrBuf cmd;
-    strbuf_init(&cmd);
-    LocalEnvState *st = self->impl;
-    const char *base = path ? path : st->working_dir;
-    strbuf_appendf(&cmd, "find '%s' -name '%s' -type f 2>/dev/null | head -500 | sort",
-                   base ? base : ".", pattern);
-
-    ExecResult *r = local_exec_command(self, cmd.data, 10000, NULL);
-    strbuf_free(&cmd);
-    char *result = r->stdout_buf;
-    r->stdout_buf = NULL;
-    exec_result_free(r);
-    return result;
+static char *local_grep(ExecutionEnv *self,const char *pattern,const char *path,const char *filter,bool ci,int maximum) {
+    return local_search(self,pattern,path,filter,ci,maximum,true);
+}
+static char *local_glob_fn(ExecutionEnv *self,const char *pattern,const char *path) {
+    return local_search(self,pattern,path,NULL,false,500,false);
 }
 
 static char *local_working_directory(ExecutionEnv *self) {
@@ -254,9 +191,10 @@ static void local_cleanup(ExecutionEnv *self) {
     free(st);
 }
 
-ExecutionEnv *local_exec_env_new(const char *working_dir) {
-    ExecutionEnv *env = calloc(1, sizeof(ExecutionEnv));
-    LocalEnvState *st = calloc(1, sizeof(LocalEnvState));
+ExecutionEnv *local_exec_env_new_policy(const char *working_dir, bool contained) {
+    ExecutionEnv *env = mem_calloc(1, sizeof(ExecutionEnv));
+    LocalEnvState *st = mem_calloc(1, sizeof(LocalEnvState));
+    if(!env || !st) {free(env);free(st);return NULL;}
 
     if (working_dir) {
         st->working_dir = str_dup(working_dir);
@@ -268,7 +206,11 @@ ExecutionEnv *local_exec_env_new(const char *working_dir) {
             st->working_dir = str_dup(".");
     }
 
+    char *canonical=st->working_dir?realpath(st->working_dir,NULL):NULL;
+    if(!canonical) {free(st->working_dir);free(st);free(env);return NULL;}
+    free(st->working_dir);st->working_dir=canonical;st->contained=contained;
     env->impl = st;
+    env->read_raw = local_read_raw;
     env->read_file = local_read_file;
     env->write_file = local_write_file;
     env->file_exists = local_file_exists;
@@ -281,17 +223,12 @@ ExecutionEnv *local_exec_env_new(const char *working_dir) {
     return env;
 }
 
+ExecutionEnv *local_exec_env_new(const char *working_dir) {return local_exec_env_new_policy(working_dir,false);}
+
 void exec_env_free(ExecutionEnv *env) {
     if (!env) return;
     if (env->cleanup) env->cleanup(env);
     free(env);
-}
-
-void exec_result_free(ExecResult *r) {
-    if (!r) return;
-    free(r->stdout_buf);
-    free(r->stderr_buf);
-    free(r);
 }
 
 /*============================================================================
@@ -311,6 +248,9 @@ void tool_registry_free(ToolRegistry *reg) {
 }
 
 void tool_registry_register(ToolRegistry *reg, RegisteredTool *tool) {
+    if(!tool || !tool->def.name || !tool->def.description || !tool->def.parameters_json || !tool->execute) {
+        reg->failed=true;if(tool) {tool_definition_free(&tool->def);free(tool);}return;
+    }
     /* Replace if exists */
     for (size_t i = 0; i < reg->count; i++) {
         if (str_eq(reg->tools[i]->def.name, tool->def.name)) {
@@ -321,8 +261,9 @@ void tool_registry_register(ToolRegistry *reg, RegisteredTool *tool) {
         }
     }
     if (reg->count >= reg->cap) {
-        reg->cap = reg->cap ? reg->cap * 2 : 8;
-        reg->tools = realloc(reg->tools, reg->cap * sizeof(RegisteredTool *));
+        size_t cap=reg->cap?reg->cap*2:8;
+        RegisteredTool **tools=mem_reallocarray(reg->tools,cap,sizeof(*tools));
+        if(!tools) {reg->failed=true;tool_definition_free(&tool->def);free(tool);return;}reg->tools=tools;reg->cap=cap;
     }
     reg->tools[reg->count++] = tool;
 }
@@ -351,41 +292,48 @@ RegisteredTool *tool_registry_get(const ToolRegistry *reg, const char *name) {
  * Built-in Tool Implementations
  *==========================================================================*/
 
-static char *tool_read_file(const char *args_json, ExecutionEnv *env) {
+static char *tool_error(bool *is_error,const char *message) {if(is_error) *is_error=true;return str_dup(message);}
+static char *tool_read_file(const char *args_json, ExecutionEnv *env,bool *is_error) {
+    if(is_error) *is_error=false;
+    if(!env || !env->read_file) return tool_error(is_error,"Error: file reads unsupported");
     const char *err = NULL;
     JsonValue *args = json_parse(args_json, &err);
-    if (!args) return str_dup("Error: invalid arguments");
+    if (!args) return tool_error(is_error,"Error: invalid arguments");
 
     const char *path = json_get_string(args, "file_path");
     int offset = json_get_int(args, "offset", 0);
     int limit = json_get_int(args, "limit", 2000);
 
-    if (!path) { json_free(args); return str_dup("Error: file_path required"); }
+    if (!path) { json_free(args); return tool_error(is_error,"Error: file_path required"); }
 
     char *content = env->read_file(env, path, offset, limit);
     json_free(args);
-    return content ? content : str_dup("Error: file not found");
+    return content ? content : tool_error(is_error,"Error: file not found");
 }
 
-static char *tool_write_file(const char *args_json, ExecutionEnv *env) {
+static char *tool_write_file(const char *args_json, ExecutionEnv *env,bool *is_error) {
+    if(is_error) *is_error=false;
+    if(!env || !env->write_file) return tool_error(is_error,"Error: file writes unsupported");
     const char *err = NULL;
     JsonValue *args = json_parse(args_json, &err);
-    if (!args) return str_dup("Error: invalid arguments");
+    if (!args) return tool_error(is_error,"Error: invalid arguments");
 
     const char *path = json_get_string(args, "file_path");
     const char *content = json_get_string(args, "content");
 
-    if (!path) { json_free(args); return str_dup("Error: file_path required"); }
+    if (!path) { json_free(args); return tool_error(is_error,"Error: file_path required"); }
 
     bool ok = env->write_file(env, path, content ? content : "");
     json_free(args);
-    return ok ? str_dup("File written successfully") : str_dup("Error: write failed");
+    return ok ? str_dup("File written successfully") : tool_error(is_error,"Error: write failed");
 }
 
-static char *tool_edit_file(const char *args_json, ExecutionEnv *env) {
+static char *tool_edit_file(const char *args_json, ExecutionEnv *env,bool *is_error) {
+    if(is_error) *is_error=false;
+    if(!env || !env->read_raw || !env->write_file) return tool_error(is_error,"Error: raw reads or file writes unsupported");
     const char *err = NULL;
     JsonValue *args = json_parse(args_json, &err);
-    if (!args) return str_dup("Error: invalid arguments");
+    if (!args) return tool_error(is_error,"Error: invalid arguments");
 
     const char *path = json_get_string(args, "file_path");
     const char *old_str = json_get_string(args, "old_string");
@@ -394,25 +342,13 @@ static char *tool_edit_file(const char *args_json, ExecutionEnv *env) {
 
     if (!path || !old_str || !new_str) {
         json_free(args);
-        return str_dup("Error: file_path, old_string, new_string required");
+        return tool_error(is_error,"Error: file_path, old_string, new_string required");
     }
 
-    /* Read file */
-    char *content = env->read_file(env, path, 0, 0);
-    if (!content) { json_free(args); return str_dup("Error: file not found"); }
-
-    /* Strip line numbers from read_file output */
-    /* Actually, we need raw content for edit. Re-read without line numbers. */
-    FILE *f = fopen(path, "r");
-    if (!f) { free(content); json_free(args); return str_dup("Error: cannot read file"); }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *raw = malloc((size_t)sz + 1);
-    size_t read_sz = fread(raw, 1, (size_t)sz, f);
-    raw[read_sz] = '\0';
-    fclose(f);
-    free(content);
+    if (!*old_str) { json_free(args); return tool_error(is_error,"Error: old_string must not be empty"); }
+    if(!env->read_raw) {json_free(args);return tool_error(is_error,"Error: raw reads unsupported");}
+    char *raw=env->read_raw(env,path);
+    if(!raw) {json_free(args);return tool_error(is_error,"Error: cannot read file");}
 
     /* Find and replace */
     int count = 0;
@@ -420,7 +356,7 @@ static char *tool_edit_file(const char *args_json, ExecutionEnv *env) {
     if (!pos) {
         free(raw);
         json_free(args);
-        return str_dup("Error: old_string not found in file");
+        return tool_error(is_error,"Error: old_string not found in file");
     }
 
     StrBuf result;
@@ -440,32 +376,39 @@ static char *tool_edit_file(const char *args_json, ExecutionEnv *env) {
     strbuf_append_cstr(&result, cursor);
 
     char *new_content = strbuf_detach(&result);
-    env->write_file(env, path, new_content);
+    bool written=new_content && env->write_file(env, path, new_content);
     free(new_content);
     free(raw);
     json_free(args);
 
+    if(!written) return tool_error(is_error,"Error: write failed");
     char msg[128];
     snprintf(msg, sizeof(msg), "Replaced %d occurrence(s)", count);
     return str_dup(msg);
 }
 
-static char *tool_shell(const char *args_json, ExecutionEnv *env) {
+static char *tool_shell(const char *args_json, ExecutionEnv *env,bool *is_error) {
+    if(is_error) *is_error=false;
+    if(!env || !env->exec_command) return tool_error(is_error,"Error: command execution unsupported");
     const char *err = NULL;
     JsonValue *args = json_parse(args_json, &err);
-    if (!args) return str_dup("Error: invalid arguments");
+    if (!args) return tool_error(is_error,"Error: invalid arguments");
 
     const char *command = json_get_string(args, "command");
     int timeout = json_get_int(args, "timeout_ms", 10000);
 
-    if (!command) { json_free(args); return str_dup("Error: command required"); }
+    if (!command) { json_free(args); return tool_error(is_error,"Error: command required"); }
 
     ExecResult *r = env->exec_command(env, command, timeout, NULL);
     json_free(args);
 
     StrBuf sb;
     strbuf_init(&sb);
+    if(!r) return tool_error(is_error,"Error: process allocation failed");
+    if(is_error) *is_error=r->timed_out || r->cancelled || r->exit_code!=0 || r->output_limited;
+    if(r->timed_out || r->cancelled || r->exit_code!=0 || r->output_limited) strbuf_appendf(&sb,"Error: command failed (exit=%d timeout=%s output_limit=%s)\n",r->exit_code,r->timed_out?"true":"false",r->output_limited?"true":"false");
     if (r->stdout_buf) strbuf_append_cstr(&sb, r->stdout_buf);
+    if(r->stderr_buf && *r->stderr_buf) strbuf_appendf(&sb,"\n[stderr] %s",r->stderr_buf);
     if (r->timed_out) {
         strbuf_appendf(&sb, "\n[ERROR: Command timed out after %dms]", timeout);
     }
@@ -474,42 +417,47 @@ static char *tool_shell(const char *args_json, ExecutionEnv *env) {
     return strbuf_detach(&sb);
 }
 
-static char *tool_grep_fn(const char *args_json, ExecutionEnv *env) {
+static char *tool_grep_fn(const char *args_json, ExecutionEnv *env,bool *is_error) {
+    if(is_error) *is_error=false;
+    if(!env || !env->grep) return tool_error(is_error,"Error: search unsupported");
     const char *err = NULL;
     JsonValue *args = json_parse(args_json, &err);
-    if (!args) return str_dup("Error: invalid arguments");
+    if (!args) return tool_error(is_error,"Error: invalid arguments");
 
     const char *pattern = json_get_string(args, "pattern");
     const char *path = json_get_string(args, "path");
     bool ci = json_get_bool(args, "case_insensitive", false);
     int max = json_get_int(args, "max_results", 100);
 
-    if (!pattern) { json_free(args); return str_dup("Error: pattern required"); }
+    if (!pattern) { json_free(args); return tool_error(is_error,"Error: pattern required"); }
 
     char *result = env->grep(env, pattern, path, NULL, ci, max);
     json_free(args);
-    return result ? result : str_dup("");
+    return result ? result : tool_error(is_error,"Error: search failed");
 }
 
-static char *tool_glob_fn(const char *args_json, ExecutionEnv *env) {
+static char *tool_glob_fn(const char *args_json, ExecutionEnv *env,bool *is_error) {
+    if(is_error) *is_error=false;
+    if(!env || !env->glob) return tool_error(is_error,"Error: glob unsupported");
     const char *err = NULL;
     JsonValue *args = json_parse(args_json, &err);
-    if (!args) return str_dup("Error: invalid arguments");
+    if (!args) return tool_error(is_error,"Error: invalid arguments");
 
     const char *pattern = json_get_string(args, "pattern");
     const char *path = json_get_string(args, "path");
 
-    if (!pattern) { json_free(args); return str_dup("Error: pattern required"); }
+    if (!pattern) { json_free(args); return tool_error(is_error,"Error: pattern required"); }
 
     char *result = env->glob(env, pattern, path);
     json_free(args);
-    return result ? result : str_dup("");
+    return result ? result : tool_error(is_error,"Error: search failed");
 }
 
 void agent_register_core_tools(ToolRegistry *reg) {
     /* read_file */
     {
-        RegisteredTool *t = calloc(1, sizeof(RegisteredTool));
+        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
+        if(!t) {reg->failed=true;return;}
         t->def.name = str_dup("read_file");
         t->def.description = str_dup("Read a file from the filesystem. Returns line-numbered content.");
         t->def.parameters_json = str_dup(
@@ -521,7 +469,8 @@ void agent_register_core_tools(ToolRegistry *reg) {
     }
     /* write_file */
     {
-        RegisteredTool *t = calloc(1, sizeof(RegisteredTool));
+        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
+        if(!t) {reg->failed=true;return;}
         t->def.name = str_dup("write_file");
         t->def.description = str_dup("Write content to a file. Creates parent directories if needed.");
         t->def.parameters_json = str_dup(
@@ -532,7 +481,8 @@ void agent_register_core_tools(ToolRegistry *reg) {
     }
     /* edit_file */
     {
-        RegisteredTool *t = calloc(1, sizeof(RegisteredTool));
+        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
+        if(!t) {reg->failed=true;return;}
         t->def.name = str_dup("edit_file");
         t->def.description = str_dup("Replace an exact string occurrence in a file.");
         t->def.parameters_json = str_dup(
@@ -544,7 +494,8 @@ void agent_register_core_tools(ToolRegistry *reg) {
     }
     /* shell */
     {
-        RegisteredTool *t = calloc(1, sizeof(RegisteredTool));
+        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
+        if(!t) {reg->failed=true;return;}
         t->def.name = str_dup("shell");
         t->def.description = str_dup("Execute a shell command. Returns stdout, stderr, and exit code.");
         t->def.parameters_json = str_dup(
@@ -556,7 +507,8 @@ void agent_register_core_tools(ToolRegistry *reg) {
     }
     /* grep */
     {
-        RegisteredTool *t = calloc(1, sizeof(RegisteredTool));
+        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
+        if(!t) {reg->failed=true;return;}
         t->def.name = str_dup("grep");
         t->def.description = str_dup("Search file contents using regex patterns.");
         t->def.parameters_json = str_dup(
@@ -568,7 +520,8 @@ void agent_register_core_tools(ToolRegistry *reg) {
     }
     /* glob */
     {
-        RegisteredTool *t = calloc(1, sizeof(RegisteredTool));
+        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
+        if(!t) {reg->failed=true;return;}
         t->def.name = str_dup("glob");
         t->def.description = str_dup("Find files matching a glob pattern.");
         t->def.parameters_json = str_dup(
@@ -597,44 +550,50 @@ static char *anthropic_system_prompt(const char *env_info, const char *project_d
 }
 
 ProviderProfile *anthropic_profile_new(const char *model) {
-    ProviderProfile *p = calloc(1, sizeof(ProviderProfile));
+    ProviderProfile *p = mem_calloc(1, sizeof(ProviderProfile));
+    if(!p) return NULL;
     p->id = str_dup("anthropic");
     p->model = str_dup(model ? model : "claude-sonnet-4-5");
-    p->supports_reasoning = true;
-    p->supports_streaming = true;
+    p->supports_reasoning = false;
+    p->supports_streaming = false;
     p->supports_parallel_tool_calls = false;
     p->context_window_size = 200000;
     p->build_system_prompt = anthropic_system_prompt;
     tool_registry_init(&p->tool_registry);
     agent_register_core_tools(&p->tool_registry);
+    if(!p->id || !p->model || p->tool_registry.failed) {provider_profile_free(p);return NULL;}
     return p;
 }
 
 ProviderProfile *openai_profile_new(const char *model) {
-    ProviderProfile *p = calloc(1, sizeof(ProviderProfile));
+    ProviderProfile *p = mem_calloc(1, sizeof(ProviderProfile));
+    if(!p) return NULL;
     p->id = str_dup("openai");
     p->model = str_dup(model ? model : "gpt-5.2");
     p->supports_reasoning = true;
-    p->supports_streaming = true;
-    p->supports_parallel_tool_calls = true;
+    p->supports_streaming = false;
+    p->supports_parallel_tool_calls = false;
     p->context_window_size = 1047576;
     p->build_system_prompt = anthropic_system_prompt; /* reuse for now */
     tool_registry_init(&p->tool_registry);
     agent_register_core_tools(&p->tool_registry);
+    if(!p->id || !p->model || p->tool_registry.failed) {provider_profile_free(p);return NULL;}
     return p;
 }
 
 ProviderProfile *gemini_profile_new(const char *model) {
-    ProviderProfile *p = calloc(1, sizeof(ProviderProfile));
+    ProviderProfile *p = mem_calloc(1, sizeof(ProviderProfile));
+    if(!p) return NULL;
     p->id = str_dup("gemini");
     p->model = str_dup(model ? model : "gemini-3-flash-preview");
-    p->supports_reasoning = true;
-    p->supports_streaming = true;
-    p->supports_parallel_tool_calls = true;
+    p->supports_reasoning = false;
+    p->supports_streaming = false;
+    p->supports_parallel_tool_calls = false;
     p->context_window_size = 1048576;
     p->build_system_prompt = anthropic_system_prompt;
     tool_registry_init(&p->tool_registry);
     agent_register_core_tools(&p->tool_registry);
+    if(!p->id || !p->model || p->tool_registry.failed) {provider_profile_free(p);return NULL;}
     return p;
 }
 
@@ -652,8 +611,8 @@ void provider_profile_free(ProviderProfile *p) {
 
 SessionConfig agent_default_config(void) {
     return (SessionConfig){
-        .max_turns = 0,
-        .max_tool_rounds_per_input = 0,
+        .max_turns = 100,
+        .max_tool_rounds_per_input = 50,
         .default_command_timeout_ms = 10000,
         .max_command_timeout_ms = 600000,
         .reasoning_effort = REASONING_NONE,
@@ -665,7 +624,9 @@ SessionConfig agent_default_config(void) {
 
 AgentSession *agent_session_new(ProviderProfile *profile, ExecutionEnv *env,
                                  LlmClient *client, SessionConfig config) {
-    AgentSession *s = calloc(1, sizeof(AgentSession));
+    if(!profile || !profile->id || !profile->model || !profile->build_system_prompt || profile->tool_registry.failed || !env || !env->working_directory || !env->platform || !client || config.max_turns<0 || config.max_tool_rounds_per_input<0 || config.default_command_timeout_ms<=0 || config.max_command_timeout_ms<config.default_command_timeout_ms || config.loop_detection_window<0) return NULL;
+    AgentSession *s = mem_calloc(1, sizeof(AgentSession));
+    if(!s) return NULL;
     s->id = gen_uuid();
     s->profile = profile;
     s->exec_env = env;
@@ -673,14 +634,15 @@ AgentSession *agent_session_new(ProviderProfile *profile, ExecutionEnv *env,
     s->config = config;
     s->state = SESSION_IDLE;
     s->history_cap = 64;
-    s->history = calloc(s->history_cap, sizeof(Message *));
+    s->history = mem_calloc(s->history_cap, sizeof(Message *));
+    if(!s->id || !s->history) {agent_session_free(s);return NULL;}
     return s;
 }
 
 void agent_session_free(AgentSession *s) {
     if (!s) return;
     free(s->id);
-    for (size_t i = 0; i < s->history_count; i++)
+    for (size_t i = 0; s->history && i < s->history_count; i++)
         message_free(s->history[i]);
     free(s->history);
     for (size_t i = 0; i < s->steering_count; i++)
@@ -697,26 +659,21 @@ void agent_session_on_event(AgentSession *s, AgentEventCallback cb, void *userda
     s->event_userdata = userdata;
 }
 
-void agent_session_steer(AgentSession *s, const char *message) {
-    s->steering_queue = realloc(s->steering_queue, (s->steering_count + 1) * sizeof(char *));
-    s->steering_queue[s->steering_count++] = str_dup(message);
+static void queue_message(AgentSession *s,char ***queue,size_t *count,const char *text) {
+    if(!text || strnlen(text,65537)>65536 || *count>=128) {s->failed=true;return;}
+    char *owned=str_dup(text);if(!owned) {s->failed=true;return;}
+    char **items=mem_reallocarray(*queue,*count+1,sizeof(char *));
+    if(!items) {free(owned);s->failed=true;return;}*queue=items;items[(*count)++]=owned;
 }
-
-void agent_session_follow_up(AgentSession *s, const char *message) {
-    s->followup_queue = realloc(s->followup_queue, (s->followup_count + 1) * sizeof(char *));
-    s->followup_queue[s->followup_count++] = str_dup(message);
-}
-
-void agent_session_abort(AgentSession *s) {
-    s->abort_signaled = true;
-}
-
-static void session_add_message(AgentSession *s, Message *m) {
-    if (s->history_count >= s->history_cap) {
-        s->history_cap *= 2;
-        s->history = realloc(s->history, s->history_cap * sizeof(Message *));
-    }
-    s->history[s->history_count++] = m;
+void agent_session_steer(AgentSession *s,const char *text) {queue_message(s,&s->steering_queue,&s->steering_count,text);}
+void agent_session_follow_up(AgentSession *s,const char *text) {queue_message(s,&s->followup_queue,&s->followup_count,text);}
+void agent_session_abort(AgentSession *s) {s->abort_signaled=true;}
+static void session_add_message(AgentSession *s,Message *m) {
+    if(!m || s->history_count>=4096) {message_free(m);s->failed=true;return;}
+    if(s->history_count>=s->history_cap) {
+        size_t cap=s->history_cap*2;Message **messages=mem_reallocarray(s->history,cap,sizeof(*messages));
+        if(!messages) {message_free(m);s->failed=true;return;}s->history=messages;s->history_cap=cap;
+    }s->history[s->history_count++]=m;
 }
 
 static void drain_steering(AgentSession *s) {
@@ -741,7 +698,8 @@ static bool detect_loop(AgentSession *s) {
         if (m->role == ROLE_ASSISTANT) {
             for (size_t j = 0; j < m->part_count; j++) {
                 if (m->parts[j]->kind == CONTENT_TOOL_CALL && m->parts[j]->tool_call) {
-                    calls = realloc(calls, (size_t)(call_count + 1) * sizeof(char *));
+                    char **items=mem_reallocarray(calls,(size_t)(call_count+1),sizeof(*items));
+                    if(!items) {free(calls);s->failed=true;return false;}calls=items;
                     calls[call_count++] = m->parts[j]->tool_call->name;
                     if (call_count >= window) break;
                 }
@@ -767,7 +725,8 @@ static bool detect_loop(AgentSession *s) {
  * Core Agentic Loop
  *==========================================================================*/
 
-void agent_session_submit(AgentSession *s, const char *input) {
+static void submit_one(AgentSession *s, const char *input) {
+    if(!input || strnlen(input,ATTRACTOR_INPUT_LIMIT+1)>ATTRACTOR_INPUT_LIMIT) {s->failed=true;return;}
     s->state = SESSION_PROCESSING;
     session_add_message(s, message_user(input));
     emit(s, AGENT_EVT_USER_INPUT, input, NULL, NULL);
@@ -776,27 +735,24 @@ void agent_session_submit(AgentSession *s, const char *input) {
 
     /* Build tool definitions */
     ToolRegistry *reg = &s->profile->tool_registry;
-    ToolDefinition **tool_defs = calloc(reg->count, sizeof(ToolDefinition *));
-    for (size_t i = 0; i < reg->count; i++) {
-        tool_defs[i] = calloc(1, sizeof(ToolDefinition));
-        tool_defs[i]->name = str_dup(reg->tools[i]->def.name);
-        tool_defs[i]->description = str_dup(reg->tools[i]->def.description);
-        tool_defs[i]->parameters_json = str_dup(reg->tools[i]->def.parameters_json);
-    }
+    ToolDefinition **tool_defs=mem_calloc(reg->count,sizeof(*tool_defs));
+    if(!tool_defs) {s->failed=true;s->state=SESSION_IDLE;return;}
+    for(size_t i=0;i<reg->count;i++) tool_defs[i]=&reg->tools[i]->def;
 
     int round_count = 0;
 
     while (1) {
         /* Check limits */
-        if (s->config.max_tool_rounds_per_input > 0 && round_count >= s->config.max_tool_rounds_per_input) {
-            emit(s, AGENT_EVT_TURN_LIMIT, "Round limit reached", NULL, NULL);
+        if (round_count >= (s->config.max_tool_rounds_per_input>0?s->config.max_tool_rounds_per_input:50)) {
+            s->failed=true;emit(s, AGENT_EVT_TURN_LIMIT, "Round limit reached", NULL, NULL);
             break;
         }
-        if (s->abort_signaled) break;
+        if (s->abort_signaled || s->failed) break;
 
         /* Build system prompt */
         char *wd = s->exec_env->working_directory(s->exec_env);
         char *plat = s->exec_env->platform(s->exec_env);
+        if(!wd || !plat) {free(wd);free(plat);s->failed=true;break;}
         char env_info[1024];
         snprintf(env_info, sizeof(env_info),
                  "<environment>\nWorking directory: %s\nPlatform: %s\nModel: %s\n</environment>",
@@ -804,10 +760,12 @@ void agent_session_submit(AgentSession *s, const char *input) {
         free(wd); free(plat);
 
         char *sys_prompt = s->profile->build_system_prompt(env_info, NULL);
+        if(!sys_prompt) {s->failed=true;break;}
 
         /* Build request */
         size_t msg_count = s->history_count + 1;
-        Message **msgs = calloc(msg_count, sizeof(Message *));
+        Message **msgs = mem_calloc(msg_count, sizeof(Message *));
+        if(!msgs) {free(sys_prompt);s->failed=true;break;}
         msgs[0] = message_system(sys_prompt);
         for (size_t i = 0; i < s->history_count; i++)
             msgs[i + 1] = s->history[i];  /* shallow ref */
@@ -822,6 +780,7 @@ void agent_session_submit(AgentSession *s, const char *input) {
             .temperature = -1,
             .top_p = -1,
             .reasoning_effort = s->config.reasoning_effort,
+            .cancel = &s->abort_signaled,
         };
 
         LlmError err = {0};
@@ -834,36 +793,14 @@ void agent_session_submit(AgentSession *s, const char *input) {
         free(sys_prompt);
 
         if (!resp) {
-            emit(s, AGENT_EVT_ERROR, err.message ? err.message : "LLM call failed", NULL, NULL);
+            s->failed=true;emit(s, AGENT_EVT_ERROR, err.message ? err.message : "LLM call failed", NULL, NULL);
             llm_error_free(&err);
             break;
         }
 
         /* Record assistant turn */
         /* Clone the response message into history */
-        Message *asst_msg = calloc(1, sizeof(Message));
-        asst_msg->role = ROLE_ASSISTANT;
-        asst_msg->parts = calloc(resp->message->part_count, sizeof(ContentPart *));
-        asst_msg->part_count = resp->message->part_count;
-        for (size_t i = 0; i < resp->message->part_count; i++) {
-            ContentPart *src = resp->message->parts[i];
-            ContentPart *dst = calloc(1, sizeof(ContentPart));
-            dst->kind = src->kind;
-            if (src->text) dst->text = str_dup(src->text);
-            if (src->tool_call) {
-                dst->tool_call = calloc(1, sizeof(ToolCallData));
-                dst->tool_call->id = str_dup(src->tool_call->id);
-                dst->tool_call->name = str_dup(src->tool_call->name);
-                dst->tool_call->arguments_json = str_dup(src->tool_call->arguments_json);
-            }
-            if (src->thinking) {
-                dst->thinking = calloc(1, sizeof(ThinkingData));
-                dst->thinking->text = str_dup(src->thinking->text);
-                dst->thinking->signature = str_dup(src->thinking->signature);
-                dst->thinking->redacted = src->thinking->redacted;
-            }
-            asst_msg->parts[i] = dst;
-        }
+        Message *asst_msg = message_clone(resp->message);
         session_add_message(s, asst_msg);
 
         emit(s, AGENT_EVT_ASSISTANT_TEXT_END, resp->text, NULL, NULL);
@@ -880,37 +817,16 @@ void agent_session_submit(AgentSession *s, const char *input) {
             ToolCall *tc = resp->tool_calls[i];
             emit(s, AGENT_EVT_TOOL_CALL_START, NULL, tc->name, tc->id);
 
-            RegisteredTool *rtool = tool_registry_get(reg, tc->name);
-            char *result_str = NULL;
-            bool is_error = false;
-
-            if (rtool && rtool->execute) {
-                result_str = rtool->execute(tc->arguments_json, s->exec_env);
-                if (!result_str) {
-                    result_str = str_dup("Tool execution error");
-                    is_error = true;
-                }
-            } else {
-                char buf[256];
-                snprintf(buf, sizeof(buf), "Unknown tool: %s", tc->name);
-                result_str = str_dup(buf);
-                is_error = true;
-            }
+            ToolExecutionContext execution={.tool=tool_registry_get(reg,tc->name),.env=s->exec_env,.default_timeout_ms=s->config.default_command_timeout_ms,.max_timeout_ms=s->config.max_command_timeout_ms};
+            bool is_error=false;char *result_str=agent_active_tool(tc->arguments_json,&execution,&is_error);
+            if(!result_str) {s->failed=true;break;}
 
             /* Truncate output for LLM (keep full for event) */
             emit(s, AGENT_EVT_TOOL_CALL_END, result_str, tc->name, tc->id);
 
-            /* Truncate to 50000 chars for the LLM */
-            if (strlen(result_str) > 50000) {
-                char *truncated = malloc(50001 + 200);
-                memcpy(truncated, result_str, 25000);
-                int removed = (int)(strlen(result_str) - 50000);
-                int offset_pos = sprintf(truncated + 25000,
-                    "\n\n[WARNING: Tool output truncated. %d chars removed.]\n\n", removed);
-                memcpy(truncated + 25000 + offset_pos, result_str + strlen(result_str) - 25000, 25000);
-                truncated[50000 + (size_t)offset_pos] = '\0';
-                free(result_str);
-                result_str = truncated;
+            if(strlen(result_str)>50000) {
+                char *shortened=str_ndup(result_str,50000);free(result_str);result_str=shortened;
+                if(!result_str) {s->failed=true;break;}
             }
 
             session_add_message(s, message_tool_result(tc->id, result_str, is_error));
@@ -930,24 +846,64 @@ void agent_session_submit(AgentSession *s, const char *input) {
         }
     }
 
-    /* Clean up tool defs */
-    for (size_t i = 0; i < reg->count; i++) {
-        tool_definition_free(tool_defs[i]);
-        free(tool_defs[i]);
-    }
     free(tool_defs);
-
-    /* Process follow-up queue */
-    if (s->followup_count > 0) {
-        char *next = s->followup_queue[0];
-        memmove(&s->followup_queue[0], &s->followup_queue[1],
-                (s->followup_count - 1) * sizeof(char *));
-        s->followup_count--;
-        agent_session_submit(s, next);
-        free(next);
-        return;
-    }
 
     s->state = SESSION_IDLE;
     emit(s, AGENT_EVT_SESSION_END, NULL, NULL, NULL);
+}
+
+void agent_session_submit(AgentSession *s,const char *input) {
+    if(!s || s->state==SESSION_PROCESSING || s->state==SESSION_CLOSED) return;
+    const char *next=input;char *owned=NULL;
+    for(size_t processed=0;processed<128 && next && !s->abort_signaled && !s->failed;processed++) {
+        if(s->turn_count >= (size_t)(s->config.max_turns?s->config.max_turns:100)) {emit(s,AGENT_EVT_TURN_LIMIT,"Turn limit reached",NULL,NULL);break;}
+        s->turn_count++;submit_one(s,next);free(owned);owned=NULL;next=NULL;
+        if(s->followup_count) {
+            owned=s->followup_queue[0];memmove(s->followup_queue,s->followup_queue+1,(s->followup_count-1)*sizeof(char *));s->followup_count--;next=owned;
+        }
+    }
+    free(owned);
+}
+
+static bool core_arguments_valid(const JsonValue *args,const ToolDefinition *def) {
+    JsonValue *schema=json_parse(def->parameters_json,NULL);if(!schema) return false;
+    JsonValue *required=json_get(schema,"required"),*properties=json_get(schema,"properties");bool valid=args && args->type==JSON_OBJECT;
+    if(required && required->type==JSON_ARRAY) for(size_t i=0;i<required->array.count;i++) {
+        JsonValue *key=required->array.items[i];if(key->type!=JSON_STRING || !json_get(args,key->string)) valid=false;
+    }
+    if(valid) for(size_t i=0;i<args->object.count;i++) {
+        JsonValue *v=args->object.values[i];const char *type=json_get_string(json_get(properties,args->object.keys[i]),"type");
+        if(!type) {valid=false;break;}
+        if(str_eq(type,"string") && v->type!=JSON_STRING) valid=false;
+        if(str_eq(type,"boolean") && v->type!=JSON_BOOL) valid=false;
+        if(str_eq(type,"integer") && (v->type!=JSON_NUMBER || !isfinite(v->number) || v->number<0 || v->number>INT_MAX || trunc(v->number)!=v->number)) valid=false;
+    }
+    json_free(schema);return valid;
+}
+char *agent_active_tool(const char *arguments_json,void *userdata,bool *is_error) {
+    ToolExecutionContext *context=userdata;const char *category=NULL,*message=NULL;char *output=NULL;bool execution_error=false;
+    if(is_error) *is_error=false;
+    JsonValue *args=json_parse(arguments_json,NULL);
+    if(!context || !context->tool || !context->tool->execute || !context->env) {category="configuration";message="Unknown tool or missing environment";}
+    else if(!core_arguments_valid(args,&context->tool->def)) {category="arguments";message="Missing or invalid tool arguments";}
+    else {
+        if(str_eq(context->tool->def.name,"shell")) {
+            int duration=json_get_int(args,"timeout_ms",context->default_timeout_ms);
+            if(duration<=0 || context->max_timeout_ms<=0) {category="arguments";message="Invalid command timeout";}
+            else json_object_set(args,"timeout_ms",json_new_number(duration>context->max_timeout_ms?context->max_timeout_ms:duration));
+        }
+        if(!category) {
+            char *encoded=json_serialize(args);
+            output=encoded?context->tool->execute(encoded,context->env,&execution_error):NULL;free(encoded);
+            if(!output) {category="execution";message="Tool execution failed";}
+            else if(execution_error) {category="execution";message=output;}
+            else if(strlen(output)>ATTRACTOR_OUTPUT_LIMIT) {category="output_limit";message="Tool output exceeded limit";}
+        }
+    }
+    JsonValue *result=json_new_object();json_object_set(result,"ok",json_new_bool(!category));
+    if(category) {
+        if(is_error) *is_error=true;
+        JsonValue *error=json_new_object();json_object_set(error,"category",json_new_string(category));json_object_set(error,"message",json_new_string(message));json_object_set(result,"error",error);
+    } else json_object_set(result,"output",json_new_string(output?output:""));
+    free(output);json_free(args);char *encoded=json_serialize(result);json_free(result);return encoded;
 }

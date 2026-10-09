@@ -3,6 +3,10 @@
 
 #include "llm/types.h"
 
+/* Blocking APIs borrow requests and all request fields for the call. Responses
+ * are owned by the caller. Initialize LlmError to zero and release with
+ * llm_error_free; callbacks/context pointers are borrowed for their call only. */
+
 /*============================================================================
  * Provider Adapter Interface
  *==========================================================================*/
@@ -12,7 +16,8 @@ typedef struct ProviderAdapter ProviderAdapter;
 /* Stream callback: called for each stream event. Return false to stop. */
 typedef bool (*StreamCallback)(const StreamEvent *event, void *userdata);
 
-/* Middleware: wraps a complete() call */
+/* Middleware wraps completion in registration order (first is outermost).
+ * The opaque ctx must be passed unchanged to next; do not retain it. */
 typedef LlmResponse *(*MiddlewareFn)(
     const LlmRequest *req,
     LlmResponse *(*next)(const LlmRequest *, void *),
@@ -29,6 +34,7 @@ struct ProviderAdapter {
                            StreamCallback cb, void *userdata, LlmError *err);
 
     /* Optional methods */
+    /* close frees nested impl members; the client then frees impl/name/adapter. */
     void (*close)(ProviderAdapter *self);
     void (*initialize)(ProviderAdapter *self);
 };
@@ -43,13 +49,16 @@ typedef struct {
     char             *default_provider;
     MiddlewareFn     *middleware;
     size_t            middleware_count;
+    const bool       *cancel; /* borrowed, synchronous owner-thread cancellation */
+    bool              failed;
 } LlmClient;
 
-/* Create a client from environment variables */
+/* Owned client; NULL on invalid configured credentials or allocation failure. */
 LlmClient  *llm_client_from_env(void);
 
 /* Create client manually */
 LlmClient  *llm_client_new(void);
+/* Transfers adapter ownership, including registration allocation failure. */
 void        llm_client_add_provider(LlmClient *c, ProviderAdapter *adapter);
 void        llm_client_set_default(LlmClient *c, const char *provider_name);
 void        llm_client_add_middleware(LlmClient *c, MiddlewareFn mw);
@@ -69,18 +78,20 @@ int          llm_client_stream(LlmClient *c, const LlmRequest *req,
 /* Tool with execute handler for high-level generate() */
 typedef struct {
     ToolDefinition def;
-    char *(*execute)(const char *arguments_json);  /* returns result string; caller frees */
+    /* Returns owned text; userdata is borrowed; failures set *is_error. */
+    char *(*execute)(const char *arguments_json, void *userdata, bool *is_error);
+    void *userdata;
 } ActiveTool;
 
 typedef struct {
     char         *text;
     char         *reasoning;
-    ToolCall    **tool_calls;
+    ToolCall    **tool_calls; /* borrowed from owned response */
     size_t        tool_call_count;
     FinishReason  finish_reason;
     Usage         usage;
     Usage         total_usage;
-    LlmResponse  *response;
+    LlmResponse  *response; /* owned; finish_reason.raw borrows from this response */
 } GenerateResult;
 
 void generate_result_free(GenerateResult *r);

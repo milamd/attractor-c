@@ -35,6 +35,7 @@ typedef struct {
 
 void agent_event_free(AgentEvent *ev);
 
+/* Events and their fields are borrowed until the callback returns. */
 typedef void (*AgentEventCallback)(const AgentEvent *event, void *userdata);
 
 /*============================================================================
@@ -43,19 +44,15 @@ typedef void (*AgentEventCallback)(const AgentEvent *event, void *userdata);
 
 typedef struct ExecutionEnv ExecutionEnv;
 
-typedef struct {
-    char   *stdout_buf;
-    char   *stderr_buf;
-    int     exit_code;
-    bool    timed_out;
-    int     duration_ms;
-} ExecResult;
-
-void exec_result_free(ExecResult *r);
+#include "util/process.h"
 
 struct ExecutionEnv {
     void *impl;
+    const bool *cancel; /* borrowed, owner-thread cancellation */
+    const char *const *extra_env; /* borrowed explicit subprocess additions */
 
+    /* Raw owned text separately from line-numbered presentation; required for edits. */
+    char *(*read_raw)(ExecutionEnv *self, const char *path);
     char *(*read_file)(ExecutionEnv *self, const char *path, int offset, int limit);
     bool  (*write_file)(ExecutionEnv *self, const char *path, const char *content);
     bool  (*file_exists)(ExecutionEnv *self, const char *path);
@@ -75,6 +72,7 @@ struct ExecutionEnv {
 };
 
 ExecutionEnv *local_exec_env_new(const char *working_dir);
+ExecutionEnv *local_exec_env_new_policy(const char *working_dir, bool contained);
 void          exec_env_free(ExecutionEnv *env);
 
 /*============================================================================
@@ -83,20 +81,32 @@ void          exec_env_free(ExecutionEnv *env);
 
 typedef struct {
     ToolDefinition  def;
-    char *(*execute)(const char *args_json, ExecutionEnv *env);
+    /* Owned text; failure is explicit, independent of output text. */
+    char *(*execute)(const char *args_json, ExecutionEnv *env, bool *is_error);
 } RegisteredTool;
 
 typedef struct {
     RegisteredTool **tools;
     size_t           count;
     size_t           cap;
+    bool             failed;
 } ToolRegistry;
 
 void            tool_registry_init(ToolRegistry *reg);
 void            tool_registry_free(ToolRegistry *reg);
+/* Registry consumes the tool and definition strings on success/failure. */
 void            tool_registry_register(ToolRegistry *reg, RegisteredTool *tool);
 void            tool_registry_unregister(ToolRegistry *reg, const char *name);
 RegisteredTool *tool_registry_get(const ToolRegistry *reg, const char *name);
+
+typedef struct {
+    RegisteredTool *tool; /* borrowed */
+    ExecutionEnv *env; /* borrowed */
+    int default_timeout_ms;
+    int max_timeout_ms;
+} ToolExecutionContext;
+/* Validates core tool arguments and returns an owned JSON result envelope. */
+char *agent_active_tool(const char *arguments_json, void *userdata, bool *is_error);
 
 /*============================================================================
  * Provider Profile
@@ -166,6 +176,8 @@ struct AgentSession {
     size_t              followup_count;
 
     bool                abort_signaled;
+    size_t              turn_count;
+    bool                failed;
 };
 
 AgentSession *agent_session_new(ProviderProfile *profile, ExecutionEnv *env,
@@ -175,6 +187,8 @@ void          agent_session_free(AgentSession *s);
 /* Submit user input and run the agentic loop */
 void agent_session_submit(AgentSession *s, const char *input);
 
+/* Sessions and callbacks are synchronous and confined to one owner thread.
+ * Concurrent steering/abort is unsupported. Dependencies are borrowed. */
 /* Inject steering message between tool rounds */
 void agent_session_steer(AgentSession *s, const char *message);
 
