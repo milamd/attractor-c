@@ -10,3 +10,5 @@ attractor-run-*/
 *.swp
 *.swo
 *~
+/build/
+*.d

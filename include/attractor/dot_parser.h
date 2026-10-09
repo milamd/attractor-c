@@ -52,6 +52,7 @@ typedef struct {
 } DotEdge;
 
 typedef struct {
+    bool     failed; /* transformation allocation/syntax failure */
     char    *name;              /* digraph name */
     DotNode *nodes;
     size_t   node_count;
@@ -74,8 +75,15 @@ typedef struct {
 DotGraph   *dot_parse(const char *source, char **err_msg);
 void        dot_graph_free(DotGraph *g);
 
+/* Shared role resolution: explicit type, recognized structural shape, names,
+ * then codergen for an untyped ordinary node. Borrowed static/type string. */
+const char *dot_node_role(const DotNode *node);
+/* Requires disjoint, acyclic branch regions with a common join. Error is owned. */
+const DotNode *dot_parallel_join(const DotGraph *graph, const DotNode *fork, char **error);
 /* Find nodes/edges */
 DotNode    *dot_find_node(const DotGraph *g, const char *id);
+/* Return total matching edges, write at most max. NULL/0 counts only; callers
+ * must compare the return to capacity before accessing the output array. */
 size_t      dot_outgoing_edges(const DotGraph *g, const char *node_id,
                                const DotEdge **out, size_t max);
 size_t      dot_incoming_edges(const DotGraph *g, const char *node_id,

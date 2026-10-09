@@ -6,6 +6,8 @@
 #include "util/str.h"
 #include "util/json.h"
 #include "util/http.h"
+#include "util/io.h"
+#include "util/mem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,19 +45,7 @@ static void print_usage(const char *argv0) {
  * Read file to string
  *==========================================================================*/
 
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t n = fread(buf, 1, (size_t)sz, f);
-    buf[n] = '\0';
-    fclose(f);
-    return buf;
-}
+static char *read_file(const char *path) { return io_read_text(path, ATTRACTOR_INPUT_LIMIT); }
 
 /*============================================================================
  * Event callback (verbose mode)
@@ -109,135 +99,6 @@ static ReasoningEffort parse_reasoning_effort(const char *s) {
     return REASONING_HIGH;
 }
 
-/*--- Tool wrappers: bridge ActiveTool (no env) to RegisteredTool (env) ---*/
-
-static ExecutionEnv *g_tool_env = NULL;  /* set before each llm_generate call */
-
-static char *active_read_file(const char *args_json) {
-    if (!g_tool_env || !g_tool_env->read_file) return str_dup("Error: no execution environment");
-    const char *parse_err = NULL;
-    JsonValue *args = json_parse(args_json, &parse_err);
-    if (!args) return str_dup("Error: invalid arguments");
-    const char *path = json_get_string(args, "file_path");
-    if (!path) path = "";
-    int offset = (int)json_get_number(args, "offset", 0);
-    int limit  = (int)json_get_number(args, "limit", 2000);
-    char *content = g_tool_env->read_file(g_tool_env, path, offset, limit);
-    json_free(args);
-    return content ? content : str_dup("Error: could not read file");
-}
-
-static char *active_write_file(const char *args_json) {
-    if (!g_tool_env || !g_tool_env->write_file) return str_dup("Error: no execution environment");
-    const char *parse_err = NULL;
-    JsonValue *args = json_parse(args_json, &parse_err);
-    if (!args) return str_dup("Error: invalid arguments");
-    const char *path    = json_get_string(args, "file_path");
-    const char *content = json_get_string(args, "content");
-    if (!path) path = "";
-    if (!content) content = "";
-    bool ok = g_tool_env->write_file(g_tool_env, path, content);
-    json_free(args);
-    return str_dup(ok ? "File written successfully" : "Error: could not write file");
-}
-
-static char *active_grep(const char *args_json) {
-    if (!g_tool_env || !g_tool_env->grep) return str_dup("Error: no execution environment");
-    const char *parse_err = NULL;
-    JsonValue *args = json_parse(args_json, &parse_err);
-    if (!args) return str_dup("Error: invalid arguments");
-    const char *pattern = json_get_string(args, "pattern");
-    const char *path    = json_get_string(args, "path");
-    const char *glob_f  = json_get_string(args, "glob");
-    if (!pattern) pattern = "";
-    if (!path) path = ".";
-    bool ci = json_get_bool(args, "case_insensitive", false);
-    int max  = (int)json_get_number(args, "max_results", 50);
-    char *result = g_tool_env->grep(g_tool_env, pattern, path, glob_f, ci, max);
-    json_free(args);
-    return result ? result : str_dup("No matches found");
-}
-
-static char *active_glob(const char *args_json) {
-    if (!g_tool_env || !g_tool_env->glob) return str_dup("Error: no execution environment");
-    const char *parse_err = NULL;
-    JsonValue *args = json_parse(args_json, &parse_err);
-    if (!args) return str_dup("Error: invalid arguments");
-    const char *pattern = json_get_string(args, "pattern");
-    const char *path    = json_get_string(args, "path");
-    if (!pattern) pattern = "";
-    if (!path) path = ".";
-    char *result = g_tool_env->glob(g_tool_env, pattern, path);
-    json_free(args);
-    return result ? result : str_dup("No matches found");
-}
-
-static char *active_shell(const char *args_json) {
-    if (!g_tool_env || !g_tool_env->exec_command) return str_dup("Error: no execution environment");
-    const char *parse_err = NULL;
-    JsonValue *args = json_parse(args_json, &parse_err);
-    if (!args) return str_dup("Error: invalid arguments");
-    const char *cmd = json_get_string(args, "command");
-    if (!cmd) cmd = "";
-    int timeout = (int)json_get_number(args, "timeout_ms", 30000);
-    char *cwd = g_tool_env->working_directory ? g_tool_env->working_directory(g_tool_env) : NULL;
-    ExecResult *er = g_tool_env->exec_command(g_tool_env, cmd, timeout, cwd);
-    free(cwd);
-    json_free(args);
-    if (!er) return str_dup("Error: command execution failed");
-    /* Format output */
-    StrBuf sb;
-    strbuf_init(&sb);
-    if (er->stdout_buf && *er->stdout_buf)
-        strbuf_append_cstr(&sb, er->stdout_buf);
-    if (er->stderr_buf && *er->stderr_buf) {
-        strbuf_append_cstr(&sb, "\n[stderr] ");
-        strbuf_append_cstr(&sb, er->stderr_buf);
-    }
-    if (er->exit_code != 0)
-        strbuf_appendf(&sb, "\n[exit_code=%d]", er->exit_code);
-    if (er->timed_out)
-        strbuf_append_cstr(&sb, "\n[timed out]");
-    exec_result_free(er);
-    return strbuf_detach(&sb);
-}
-
-/* ActiveTool definitions for llm_generate */
-static ActiveTool g_active_tools[] = {
-    {
-        .def = { .name = "read_file",
-                 .description = "Read a file from the filesystem. Returns line-numbered content.",
-                 .parameters_json = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file\"},\"offset\":{\"type\":\"integer\",\"description\":\"Line offset (0-based)\"},\"limit\":{\"type\":\"integer\",\"description\":\"Max lines to read (default 2000)\"}},\"required\":[\"file_path\"]}" },
-        .execute = active_read_file
-    },
-    {
-        .def = { .name = "write_file",
-                 .description = "Write content to a file. Creates parent directories if needed.",
-                 .parameters_json = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file\"},\"content\":{\"type\":\"string\",\"description\":\"Content to write\"}},\"required\":[\"file_path\",\"content\"]}" },
-        .execute = active_write_file
-    },
-    {
-        .def = { .name = "grep",
-                 .description = "Search file contents for a regex pattern. Returns matching lines with file paths and line numbers.",
-                 .parameters_json = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Regex pattern to search for\"},\"path\":{\"type\":\"string\",\"description\":\"Directory or file to search in\"},\"glob\":{\"type\":\"string\",\"description\":\"Glob filter for filenames (e.g. *.c)\"},\"case_insensitive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\"}},\"required\":[\"pattern\"]}" },
-        .execute = active_grep
-    },
-    {
-        .def = { .name = "glob",
-                 .description = "Find files matching a glob pattern. Returns list of matching file paths.",
-                 .parameters_json = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Glob pattern (e.g. **/*.c)\"},\"path\":{\"type\":\"string\",\"description\":\"Base directory to search from\"}},\"required\":[\"pattern\"]}" },
-        .execute = active_glob
-    },
-    {
-        .def = { .name = "shell",
-                 .description = "Execute a shell command. Returns stdout, stderr, and exit code.",
-                 .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute\"},\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Timeout in milliseconds (default 30000)\"}},\"required\":[\"command\"]}" },
-        .execute = active_shell
-    }
-};
-
-#define ACTIVE_TOOL_COUNT (sizeof(g_active_tools) / sizeof(g_active_tools[0]))
-
 static char *agent_backend_run(CodergenBackend *self, const DotNode *node,
                                 const char *prompt, const PipelineContext *ctx) {
     AgentBackendState *st = self->impl;
@@ -247,17 +108,22 @@ static char *agent_backend_run(CodergenBackend *self, const DotNode *node,
     const char *model    = (node && node->llm_model)    ? node->llm_model    : st->model;
     const char *provider = (node && node->llm_provider)  ? node->llm_provider  : st->provider;
     ReasoningEffort effort = (node && node->reasoning_effort)
-        ? parse_reasoning_effort(node->reasoning_effort) : REASONING_HIGH;
+        ? parse_reasoning_effort(node->reasoning_effort) : (str_eq(provider,"openai")?REASONING_HIGH:REASONING_NONE);
 
-    /* Set global env for tool wrappers */
-    g_tool_env = st->exec_env;
+    ToolRegistry registry;tool_registry_init(&registry);agent_register_core_tools(&registry);
+    ActiveTool tools[6]={0};ToolExecutionContext contexts[6]={0};
+    if(registry.failed || registry.count>6) {tool_registry_free(&registry);return NULL;}
+    for(size_t i=0;i<registry.count;i++) {
+        contexts[i]=(ToolExecutionContext){.tool=registry.tools[i],.env=st->exec_env,.default_timeout_ms=10000,.max_timeout_ms=600000};
+        tools[i]=(ActiveTool){.def=registry.tools[i]->def,.execute=agent_active_tool,.userdata=&contexts[i]};
+    }
 
     LlmError err = {0};
     GenerateResult *result = llm_generate(
         st->llm, model, prompt,
         NULL, 0,      /* messages */
         NULL,          /* system_prompt */
-        g_active_tools, ACTIVE_TOOL_COUNT,
+        tools, registry.count,
         50,            /* max_tool_rounds */
         effort,
         provider,
@@ -265,7 +131,7 @@ static char *agent_backend_run(CodergenBackend *self, const DotNode *node,
         &err
     );
 
-    g_tool_env = NULL;  /* clear after use */
+    tool_registry_free(&registry);
 
     if (!result) {
         fprintf(stderr, "LLM error: %s\n", err.message ? err.message : "unknown");
@@ -399,13 +265,14 @@ int main(int argc, char **argv) {
                  tm->tm_hour, tm->tm_min, tm->tm_sec);
         logs_dir = logs_buf;
     }
-    mkdir(logs_dir, 0755);
+    if(!io_mkdirs(logs_dir)) {fprintf(stderr,"Cannot create private logs directory\n");dot_graph_free(graph);return 1;}
 
     /* Initialize HTTP (for LLM calls) */
-    http_global_init();
+    if(!http_global_init()) {fprintf(stderr,"HTTP initialization failed\n");dot_graph_free(graph);return 1;}
 
     /* Create runner */
     PipelineRunner *runner = pipeline_runner_new(graph, logs_dir);
+    if(!runner) {dot_graph_free(graph);http_global_cleanup();return 1;}
     pipeline_register_builtin_handlers(runner);
 
     if (verbose)
@@ -422,21 +289,20 @@ int main(int argc, char **argv) {
     LlmClient *llm = NULL;
     CodergenBackend *backend = NULL;
     AgentBackendState *backend_state = NULL;
-    ExecutionEnv *exec_env = NULL;
+    ExecutionEnv *exec_env = local_exec_env_new(NULL);
+    if(!exec_env) {pipeline_runner_free(runner);dot_graph_free(graph);http_global_cleanup();return 1;}
+    pipeline_runner_set_execution_env(runner,exec_env);
 
     if (!dry_run) {
         llm = llm_client_from_env();
+        if (!llm) {fprintf(stderr,"Cannot initialize configured LLM providers\n");pipeline_runner_free(runner);dot_graph_free(graph);exec_env_free(exec_env);http_global_cleanup();return 1;}
         if (llm->provider_count == 0) {
             fprintf(stderr, "Warning: no LLM providers configured. Running in dry-run mode.\n");
             fprintf(stderr, "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.\n");
         } else {
-            /* Create execution environment rooted at cwd */
-            char cwd[4096];
-            if (getcwd(cwd, sizeof(cwd)))
-                exec_env = local_exec_env_new(cwd);
-
-            backend = calloc(1, sizeof(CodergenBackend));
-            backend_state = calloc(1, sizeof(AgentBackendState));
+            backend = mem_calloc(1, sizeof(CodergenBackend));
+            backend_state = mem_calloc(1, sizeof(AgentBackendState));
+            if(!backend || !backend_state) {free(backend);free(backend_state);pipeline_runner_free(runner);dot_graph_free(graph);exec_env_free(exec_env);llm_client_free(llm);http_global_cleanup();return 1;}
             backend_state->llm = llm;
             backend_state->exec_env = exec_env;
             /* Model/provider resolution: CLI override > graph default > auto-detect */
@@ -465,13 +331,14 @@ int main(int argc, char **argv) {
 
     /* Report result */
     printf("\n=== Pipeline Result ===\n");
-    const char *status_str = "unknown";
+    const char *status_str;
     switch (result.status) {
         case STAGE_SUCCESS:         status_str = "SUCCESS"; break;
         case STAGE_PARTIAL_SUCCESS: status_str = "PARTIAL_SUCCESS"; break;
         case STAGE_RETRY:           status_str = "RETRY"; break;
         case STAGE_FAIL:            status_str = "FAIL"; break;
         case STAGE_SKIPPED:         status_str = "SKIPPED"; break;
+        default: status_str="UNKNOWN";break;
     }
     printf("Status: %s\n", status_str);
     if (result.notes)
@@ -485,7 +352,7 @@ int main(int argc, char **argv) {
     /* Cleanup */
     outcome_free(&result);
     pipeline_runner_free(runner);
-    /* Note: graph is freed by runner; backend is not owned by runner */
+    dot_graph_free(graph); /* Runner borrows graph and backend. */
     free(backend_state);
     free(backend);
     if (exec_env) exec_env_free(exec_env);

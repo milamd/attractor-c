@@ -2,7 +2,10 @@
 #include "util/str.h"
 #include "util/json.h"
 #include "util/http.h"
+#include "util/mem.h"
+#include <limits.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -42,6 +45,7 @@ LlmErrorCode llm_error_from_status(int status) {
 static void set_error(LlmError *err, LlmErrorCode code, const char *msg,
                       const char *provider, int status, bool retryable) {
     if (!err) return;
+    llm_error_free(err);
     err->code = code;
     err->message = str_dup(msg);
     err->provider = str_dup(provider);
@@ -49,6 +53,21 @@ static void set_error(LlmError *err, LlmErrorCode code, const char *msg,
     err->retryable = retryable;
     err->retry_after = -1.0;
     err->raw_json = NULL;
+}
+
+static char *quoted(const char *text) {
+    JsonValue *value=json_new_string(text);char *encoded=json_serialize(value);json_free(value);return encoded;
+}
+static void append_number(StrBuf *buffer,const char *key,double number) {
+    JsonValue *value=json_new_number(number);char *encoded=json_serialize(value);json_free(value);
+    if(encoded) strbuf_appendf(buffer,"%s%s",key,encoded);else buffer->failed=true;free(encoded);
+}
+static char *url_component(const char *text) {
+    StrBuf b;strbuf_init(&b);
+    for(const unsigned char *p=(const unsigned char *)str_safe(text);*p;p++) {
+        if((*p>='a' && *p<='z') || (*p>='A' && *p<='Z') || (*p>='0' && *p<='9') || strchr("-_.~",*p)) strbuf_append(&b,(const char *)p,1);
+        else strbuf_appendf(&b,"%%%02X",(unsigned)*p);
+    }return strbuf_detach(&b);
 }
 
 /*============================================================================
@@ -61,19 +80,28 @@ typedef struct {
 } AnthropicState;
 
 static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+    unsigned long request_failures=mem_failure_count();
     AnthropicState *st = self->impl;
+    if(req->reasoning_effort!=REASONING_NONE) {set_error(err,LLM_ERR_CONFIG,"Reasoning effort control is unsupported for Anthropic","anthropic",0,false);return NULL;}
+    for(size_t i=0;i<req->message_count;i++) for(size_t k=0;k<req->messages[i]->part_count;k++) {
+        ContentPart *part=req->messages[i]->parts[k];
+        if(!part || !(part->kind==CONTENT_TEXT || part->kind==CONTENT_TOOL_CALL || part->kind==CONTENT_TOOL_RESULT || part->kind==CONTENT_THINKING || part->kind==CONTENT_REDACTED_THINKING)) {set_error(err,LLM_ERR_CONFIG,"Unsupported content kind for adapter","anthropic",0,false);return NULL;}
+    }
+
 
     /* Build request body */
     char *system_prompt = NULL;
     char *messages_json = build_messages_json_anthropic(req->messages, req->message_count, &system_prompt);
-    char *tools_json = req->tool_count > 0
+    char *tools_json = req->tool_count > 0 && !(req->tool_choice && req->tool_choice->mode==TOOL_CHOICE_NONE)
         ? build_tools_json_anthropic(req->tools, req->tool_count)
         : NULL;
 
     StrBuf body;
     strbuf_init(&body);
-    strbuf_appendf(&body, "{\"model\":\"%s\",\"max_tokens\":%d",
-                   req->model, req->max_tokens > 0 ? req->max_tokens : 4096);
+    char *model_json=quoted(req->model);
+    if(!model_json) body.failed=true;
+    else strbuf_appendf(&body,"{\"model\":%s,\"max_tokens\":%d",model_json,req->max_tokens>0?req->max_tokens:4096);
+    free(model_json);
 
     if (system_prompt) {
         /* Escape system prompt for JSON */
@@ -95,8 +123,8 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
                 case TOOL_CHOICE_AUTO:     strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"auto\"}"); break;
                 case TOOL_CHOICE_REQUIRED: strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"any\"}"); break;
                 case TOOL_CHOICE_NAMED:
-                    strbuf_appendf(&body, ",\"tool_choice\":{\"type\":\"tool\",\"name\":\"%s\"}",
-                                   req->tool_choice->tool_name);
+                    {char *name=quoted(req->tool_choice->tool_name);
+                    if(!name) body.failed=true;else strbuf_appendf(&body,",\"tool_choice\":{\"type\":\"tool\",\"name\":%s}",name);free(name);}
                     break;
                 case TOOL_CHOICE_NONE:
                     /* Anthropic: omit tools entirely for "none" */
@@ -106,8 +134,8 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
         free(tools_json);
     }
 
-    if (req->temperature >= 0) strbuf_appendf(&body, ",\"temperature\":%g", req->temperature);
-    if (req->top_p >= 0) strbuf_appendf(&body, ",\"top_p\":%g", req->top_p);
+    if (req->temperature >= 0) append_number(&body,",\"temperature\":",req->temperature);
+    if (req->top_p >= 0) append_number(&body,",\"top_p\":",req->top_p);
 
     strbuf_append_cstr(&body, "}");
 
@@ -132,10 +160,12 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
         .body = body.data,
         .body_len = body.len,
         .headers = hdrs,
-        .timeout_ms = 120000
+        .cancel=req->cancel, .timeout_ms = 120000
     };
 
-    HttpResponse *resp = http_request(&hreq);
+    JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
+    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    json_free(validated);
     strbuf_free(&url);
     char *body_str = strbuf_detach(&body);
     free(body_str);
@@ -148,8 +178,10 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
     if (resp->status_code < 200 || resp->status_code >= 300) {
         bool retryable = (resp->status_code == 429 || resp->status_code >= 500);
         set_error(err, llm_error_from_status(resp->status_code),
-                  resp->body ? resp->body : "request failed",
+                  "Provider rejected request",
                   "anthropic", resp->status_code, retryable);
+        if(err) {char hint[64];const char *value=http_header_get(resp->headers_raw,"Retry-After",hint,sizeof(hint));
+            if(value) {char *end;double seconds=strtod(value,&end);if(!*end && isfinite(seconds) && seconds>=0) err->retry_after=seconds;}}
         http_response_free(resp);
         return NULL;
     }
@@ -162,6 +194,7 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
         set_error(err, LLM_ERR_PROVIDER, "Failed to parse response", "anthropic", 200, false);
     }
 
+    if(result && (!result->provider || !result->raw_json)) {llm_response_free(result);result=NULL;set_error(err,LLM_ERR_PROVIDER,"Response allocation failed",self->name,0,false);}
     http_response_free(resp);
     return result;
 }
@@ -173,16 +206,25 @@ static int anthropic_stream(ProviderAdapter *self, const LlmRequest *req,
     return -1;
 }
 
+static void anthropic_close(ProviderAdapter *self) {
+    AnthropicState *st=self->impl;
+    if(st) {free(st->api_key);free(st->base_url);}
+}
+
 ProviderAdapter *anthropic_adapter_new(const char *api_key, const char *base_url) {
-    ProviderAdapter *a = calloc(1, sizeof(ProviderAdapter));
+    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n')) return NULL;
+    ProviderAdapter *a = mem_calloc(1, sizeof(ProviderAdapter));
+    if(!a) return NULL;
     a->name = str_dup("anthropic");
-    AnthropicState *st = calloc(1, sizeof(AnthropicState));
+    AnthropicState *st = mem_calloc(1, sizeof(AnthropicState));
+    if(!st) {free(a->name);free(a);return NULL;}
     st->api_key = str_dup(api_key);
     st->base_url = str_dup(base_url);
     a->impl = st;
     a->complete = anthropic_complete;
     a->stream = anthropic_stream;
-    a->close = NULL;
+    a->close = anthropic_close;
+    if(!a->name || !st->api_key || (base_url && !st->base_url)) {anthropic_close(a);free(st);free(a->name);free(a);return NULL;}
     return a;
 }
 
@@ -196,7 +238,13 @@ typedef struct {
 } OpenAIState;
 
 static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+    unsigned long request_failures=mem_failure_count();
     OpenAIState *st = self->impl;
+    for(size_t i=0;i<req->message_count;i++) for(size_t k=0;k<req->messages[i]->part_count;k++) {
+        ContentPart *part=req->messages[i]->parts[k];
+        if(!part || !(part->kind==CONTENT_TEXT || part->kind==CONTENT_TOOL_CALL || part->kind==CONTENT_TOOL_RESULT || part->kind==CONTENT_THINKING)) {set_error(err,LLM_ERR_CONFIG,"Unsupported content kind for adapter","openai",0,false);return NULL;}
+    }
+
 
     char *instructions = NULL;
     char *input_json = build_messages_json_openai(req->messages, req->message_count, &instructions);
@@ -206,7 +254,9 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
 
     StrBuf body;
     strbuf_init(&body);
-    strbuf_appendf(&body, "{\"model\":\"%s\"", req->model);
+    char *model_json=quoted(req->model);
+    if(!model_json) body.failed=true;else strbuf_appendf(&body,"{\"model\":%s",model_json);
+    free(model_json);
 
     if (instructions) {
         JsonValue *ins = json_new_string(instructions);
@@ -225,8 +275,14 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
         free(tools_json);
     }
 
+    if(req->tool_choice) {
+        const char *choice=req->tool_choice->mode==TOOL_CHOICE_NONE?"none":req->tool_choice->mode==TOOL_CHOICE_REQUIRED?"required":"auto";
+        if(req->tool_choice->mode==TOOL_CHOICE_NAMED) {char *name=quoted(req->tool_choice->tool_name);if(!name) body.failed=true;else strbuf_appendf(&body,",\"tool_choice\":{\"type\":\"function\",\"name\":%s}",name);free(name);}
+        else strbuf_appendf(&body,",\"tool_choice\":\"%s\"",choice);
+    }
+    if(req->top_p>=0) append_number(&body,",\"top_p\":",req->top_p);
     if (req->max_tokens > 0) strbuf_appendf(&body, ",\"max_output_tokens\":%d", req->max_tokens);
-    if (req->temperature >= 0) strbuf_appendf(&body, ",\"temperature\":%g", req->temperature);
+    if (req->temperature >= 0) append_number(&body,",\"temperature\":",req->temperature);
 
     if (req->reasoning_effort != REASONING_NONE) {
         const char *effort = NULL;
@@ -253,10 +309,12 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
     HttpRequest hreq = {
         .url = url.data, .method = "POST",
         .body = body.data, .body_len = body.len,
-        .headers = hdrs, .timeout_ms = 120000
+        .headers = hdrs, .cancel=req->cancel, .timeout_ms = 120000
     };
 
-    HttpResponse *resp = http_request(&hreq);
+    JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
+    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    json_free(validated);
     strbuf_free(&url);
     char *body_cpy = strbuf_detach(&body);
     free(body_cpy);
@@ -269,8 +327,10 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
     if (resp->status_code < 200 || resp->status_code >= 300) {
         bool retryable = (resp->status_code == 429 || resp->status_code >= 500);
         set_error(err, llm_error_from_status(resp->status_code),
-                  resp->body ? resp->body : "request failed",
+                  "Provider rejected request",
                   "openai", resp->status_code, retryable);
+        if(err) {char hint[64];const char *value=http_header_get(resp->headers_raw,"Retry-After",hint,sizeof(hint));
+            if(value) {char *end;double seconds=strtod(value,&end);if(!*end && isfinite(seconds) && seconds>=0) err->retry_after=seconds;}}
         http_response_free(resp);
         return NULL;
     }
@@ -283,6 +343,7 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
         set_error(err, LLM_ERR_PROVIDER, "Failed to parse response", "openai", 200, false);
     }
 
+    if(result && (!result->provider || !result->raw_json)) {llm_response_free(result);result=NULL;set_error(err,LLM_ERR_PROVIDER,"Response allocation failed",self->name,0,false);}
     http_response_free(resp);
     return result;
 }
@@ -294,15 +355,25 @@ static int openai_stream(ProviderAdapter *self, const LlmRequest *req,
     return -1;
 }
 
+static void openai_close(ProviderAdapter *self) {
+    OpenAIState *st=self->impl;
+    if(st) {free(st->api_key);free(st->base_url);}
+}
+
 ProviderAdapter *openai_adapter_new(const char *api_key, const char *base_url) {
-    ProviderAdapter *a = calloc(1, sizeof(ProviderAdapter));
+    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n')) return NULL;
+    ProviderAdapter *a = mem_calloc(1, sizeof(ProviderAdapter));
+    if(!a) return NULL;
     a->name = str_dup("openai");
-    OpenAIState *st = calloc(1, sizeof(OpenAIState));
+    OpenAIState *st = mem_calloc(1, sizeof(OpenAIState));
+    if(!st) {free(a->name);free(a);return NULL;}
     st->api_key = str_dup(api_key);
     st->base_url = str_dup(base_url);
     a->impl = st;
     a->complete = openai_complete;
     a->stream = openai_stream;
+    a->close = openai_close;
+    if(!a->name || !st->api_key || (base_url && !st->base_url)) {openai_close(a);free(st);free(a->name);free(a);return NULL;}
     return a;
 }
 
@@ -316,7 +387,14 @@ typedef struct {
 } GeminiState;
 
 static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+    unsigned long request_failures=mem_failure_count();
     GeminiState *st = self->impl;
+    if(req->reasoning_effort!=REASONING_NONE || (req->tool_choice && req->tool_choice->mode!=TOOL_CHOICE_AUTO)) {set_error(err,LLM_ERR_CONFIG,"Reasoning effort and named tool-choice control are unsupported for Gemini","gemini",0,false);return NULL;}
+    for(size_t i=0;i<req->message_count;i++) for(size_t k=0;k<req->messages[i]->part_count;k++) {
+        ContentPart *part=req->messages[i]->parts[k];
+        if(!part || !(part->kind==CONTENT_TEXT || part->kind==CONTENT_TOOL_CALL || part->kind==CONTENT_TOOL_RESULT || (part->kind==CONTENT_THINKING && part->provider_metadata_json))) {set_error(err,LLM_ERR_CONFIG,"Unsupported content kind for adapter","gemini",0,false);return NULL;}
+    }
+
 
     char *system_instruction = NULL;
     char *contents_json = build_messages_json_gemini(req->messages, req->message_count, &system_instruction);
@@ -349,7 +427,8 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     strbuf_append_cstr(&gc, ",\"generationConfig\":{");
     bool has_gc = false;
     if (req->max_tokens > 0) { strbuf_appendf(&gc, "\"maxOutputTokens\":%d", req->max_tokens); has_gc = true; }
-    if (req->temperature >= 0) { if (has_gc) strbuf_append_cstr(&gc, ","); strbuf_appendf(&gc, "\"temperature\":%g", req->temperature); has_gc = true; }
+    if (req->temperature >= 0) { if (has_gc) strbuf_append_cstr(&gc, ","); append_number(&gc,"\"temperature\":",req->temperature); has_gc = true; }
+    if(req->top_p>=0) {if(has_gc) strbuf_append_cstr(&gc,",");append_number(&gc,"\"topP\":",req->top_p);has_gc=true;}
     strbuf_append_cstr(&gc, "}");
     if (has_gc) strbuf_append_cstr(&body, gc.data);
     strbuf_free(&gc);
@@ -358,18 +437,22 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
 
     StrBuf url;
     strbuf_init(&url);
-    strbuf_appendf(&url, "%s/v1beta/models/%s:generateContent?key=%s",
-                   st->base_url ? st->base_url : "https://generativelanguage.googleapis.com",
-                   req->model, st->api_key);
+    char *model_path=url_component(req->model);
+    if(!model_path) url.failed=true;
+    else strbuf_appendf(&url,"%s/v1beta/models/%s:generateContent",st->base_url?st->base_url:"https://generativelanguage.googleapis.com",model_path);
+    free(model_path);
 
-    const char *hdrs[] = { "Content-Type: application/json", NULL };
+    char auth_hdr[512];snprintf(auth_hdr,sizeof(auth_hdr),"x-goog-api-key: %s",st->api_key);
+    const char *hdrs[] = { "Content-Type: application/json", auth_hdr, NULL };
     HttpRequest hreq = {
         .url = url.data, .method = "POST",
         .body = body.data, .body_len = body.len,
-        .headers = hdrs, .timeout_ms = 120000
+        .headers = hdrs, .cancel=req->cancel, .timeout_ms = 120000
     };
 
-    HttpResponse *resp = http_request(&hreq);
+    JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
+    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    json_free(validated);
     strbuf_free(&url);
     char *body_cpy = strbuf_detach(&body);
     free(body_cpy);
@@ -382,8 +465,10 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     if (resp->status_code < 200 || resp->status_code >= 300) {
         bool retryable = (resp->status_code == 429 || resp->status_code >= 500);
         set_error(err, llm_error_from_status(resp->status_code),
-                  resp->body ? resp->body : "request failed",
+                  "Provider rejected request",
                   "gemini", resp->status_code, retryable);
+        if(err) {char hint[64];const char *value=http_header_get(resp->headers_raw,"Retry-After",hint,sizeof(hint));
+            if(value) {char *end;double seconds=strtod(value,&end);if(!*end && isfinite(seconds) && seconds>=0) err->retry_after=seconds;}}
         http_response_free(resp);
         return NULL;
     }
@@ -396,6 +481,7 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
         set_error(err, LLM_ERR_PROVIDER, "Failed to parse response", "gemini", 200, false);
     }
 
+    if(result && (!result->provider || !result->raw_json)) {llm_response_free(result);result=NULL;set_error(err,LLM_ERR_PROVIDER,"Response allocation failed",self->name,0,false);}
     http_response_free(resp);
     return result;
 }
@@ -407,15 +493,25 @@ static int gemini_stream(ProviderAdapter *self, const LlmRequest *req,
     return -1;
 }
 
+static void gemini_close(ProviderAdapter *self) {
+    GeminiState *st=self->impl;
+    if(st) {free(st->api_key);free(st->base_url);}
+}
+
 ProviderAdapter *gemini_adapter_new(const char *api_key, const char *base_url) {
-    ProviderAdapter *a = calloc(1, sizeof(ProviderAdapter));
+    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n')) return NULL;
+    ProviderAdapter *a = mem_calloc(1, sizeof(ProviderAdapter));
+    if(!a) return NULL;
     a->name = str_dup("gemini");
-    GeminiState *st = calloc(1, sizeof(GeminiState));
+    GeminiState *st = mem_calloc(1, sizeof(GeminiState));
+    if(!st) {free(a->name);free(a);return NULL;}
     st->api_key = str_dup(api_key);
     st->base_url = str_dup(base_url);
     a->impl = st;
     a->complete = gemini_complete;
     a->stream = gemini_stream;
+    a->close = gemini_close;
+    if(!a->name || !st->api_key || (base_url && !st->base_url)) {gemini_close(a);free(st);free(a->name);free(a);return NULL;}
     return a;
 }
 
@@ -463,7 +559,7 @@ static char *build_messages_json_anthropic(Message **msgs, size_t count, char **
                 if (p->tool_call->arguments_json) {
                     const char *e = NULL;
                     JsonValue *args = json_parse(p->tool_call->arguments_json, &e);
-                    json_object_set(block, "input", args ? args : json_new_object());
+                    json_object_set(block, "input", args);
                 }
             } else if (p->kind == CONTENT_TOOL_RESULT && p->tool_result) {
                 json_object_set(block, "type", json_new_string("tool_result"));
@@ -536,10 +632,9 @@ static char *build_messages_json_openai(Message **msgs, size_t count, char **ins
                 json_object_set(item, "type", json_new_string("function_call_output"));
                 json_object_set(item, "call_id", json_new_string(p->tool_result->tool_call_id));
                 json_object_set(item, "output", json_new_string(p->tool_result->content ? p->tool_result->content : ""));
-            } else {
-                json_free(item);
-                continue;
-            }
+            } else if(p->kind==CONTENT_THINKING && p->thinking && p->thinking->signature) {
+                json_free(item);item=json_parse(p->thinking->signature,NULL);
+            } else {json_free(item);arr->failed=true;continue;}
             json_array_push(arr, item);
         }
     }
@@ -551,6 +646,13 @@ static char *build_messages_json_openai(Message **msgs, size_t count, char **ins
     return result;
 }
 
+static const char *tool_name_for_id(Message **messages,size_t count,const char *id) {
+    for(size_t i=count;i>0;i--) for(size_t j=0;j<messages[i-1]->part_count;j++) {
+        ContentPart *part=messages[i-1]->parts[j];
+        if(part->kind==CONTENT_TOOL_CALL && part->tool_call && str_eq(part->tool_call->id,id)) return part->tool_call->name;
+    }
+    return NULL;
+}
 /* Build Gemini contents JSON */
 static char *build_messages_json_gemini(Message **msgs, size_t count, char **system_instruction_out) {
     StrBuf sys;
@@ -576,7 +678,9 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
 
         for (size_t j = 0; j < m->part_count; j++) {
             ContentPart *p = m->parts[j];
-            if (p->kind == CONTENT_TEXT && p->text) {
+            if(p->provider_metadata_json) {
+                JsonValue *original=json_parse(p->provider_metadata_json,NULL);json_array_push(parts,original);
+            } else if (p->kind == CONTENT_TEXT && p->text) {
                 JsonValue *part = json_new_object();
                 json_object_set(part, "text", json_new_string(p->text));
                 json_array_push(parts, part);
@@ -587,16 +691,16 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
                 if (p->tool_call->arguments_json) {
                     const char *e = NULL;
                     JsonValue *args = json_parse(p->tool_call->arguments_json, &e);
-                    json_object_set(fc, "args", args ? args : json_new_object());
+                    json_object_set(fc, "args", args);
                 }
                 json_object_set(part, "functionCall", fc);
                 json_array_push(parts, part);
             } else if (p->kind == CONTENT_TOOL_RESULT && p->tool_result) {
                 JsonValue *part = json_new_object();
                 JsonValue *fr = json_new_object();
-                json_object_set(fr, "name", json_new_string(p->tool_result->tool_call_id));
+                json_object_set(fr, "name", json_new_string(tool_name_for_id(msgs,i,p->tool_result->tool_call_id)));
                 JsonValue *resp_obj = json_new_object();
-                json_object_set(resp_obj, "result", json_new_string(p->tool_result->content ? p->tool_result->content : ""));
+                json_object_set(resp_obj, p->tool_result->is_error?"error":"result", json_new_string(p->tool_result->content ? p->tool_result->content : ""));
                 json_object_set(fr, "response", resp_obj);
                 json_object_set(part, "functionResponse", fr);
                 json_array_push(parts, part);
@@ -619,11 +723,11 @@ static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count) {
     for (size_t i = 0; i < count; i++) {
         JsonValue *t = json_new_object();
         json_object_set(t, "name", json_new_string(tools[i]->name));
-        json_object_set(t, "description", json_new_string(tools[i]->description));
+        json_object_set(t, "description", json_new_string(str_safe(tools[i]->description)));
         if (tools[i]->parameters_json) {
             const char *e = NULL;
             JsonValue *schema = json_parse(tools[i]->parameters_json, &e);
-            json_object_set(t, "input_schema", schema ? schema : json_new_object());
+            json_object_set(t, "input_schema", schema);
         }
         json_array_push(arr, t);
     }
@@ -639,11 +743,11 @@ static char *build_tools_json_openai(ToolDefinition **tools, size_t count) {
         JsonValue *t = json_new_object();
         json_object_set(t, "type", json_new_string("function"));
         json_object_set(t, "name", json_new_string(tools[i]->name));
-        json_object_set(t, "description", json_new_string(tools[i]->description));
+        json_object_set(t, "description", json_new_string(str_safe(tools[i]->description)));
         if (tools[i]->parameters_json) {
             const char *e = NULL;
             JsonValue *schema = json_parse(tools[i]->parameters_json, &e);
-            json_object_set(t, "parameters", schema ? schema : json_new_object());
+            json_object_set(t, "parameters", schema);
         }
         json_array_push(arr, t);
     }
@@ -660,11 +764,11 @@ static char *build_tools_json_gemini(ToolDefinition **tools, size_t count) {
     for (size_t i = 0; i < count; i++) {
         JsonValue *fn = json_new_object();
         json_object_set(fn, "name", json_new_string(tools[i]->name));
-        json_object_set(fn, "description", json_new_string(tools[i]->description));
+        json_object_set(fn, "description", json_new_string(str_safe(tools[i]->description)));
         if (tools[i]->parameters_json) {
             const char *e = NULL;
             JsonValue *schema = json_parse(tools[i]->parameters_json, &e);
-            json_object_set(fn, "parameters", schema ? schema : json_new_object());
+            json_object_set(fn, "parameters", schema);
         }
         json_array_push(decls, fn);
     }
@@ -679,305 +783,116 @@ static char *build_tools_json_gemini(ToolDefinition **tools, size_t count) {
  * Response Parsers
  *==========================================================================*/
 
-static LlmResponse *parse_anthropic_response(const char *json_str) {
-    const char *e = NULL;
-    JsonValue *root = json_parse(json_str, &e);
-    if (!root) return NULL;
-
-    LlmResponse *r = calloc(1, sizeof(LlmResponse));
-    r->id = str_dup(json_get_string(root, "id"));
-    r->model = str_dup(json_get_string(root, "model"));
-
-    /* Parse content blocks */
-    JsonValue *content = json_get(root, "content");
-    StrBuf text_buf, reasoning_buf;
-    strbuf_init(&text_buf);
-    strbuf_init(&reasoning_buf);
-    size_t tc_cap = 0;
-    r->tool_calls = NULL;
-    r->tool_call_count = 0;
-
-    Message *msg = calloc(1, sizeof(Message));
-    msg->role = ROLE_ASSISTANT;
-    size_t parts_cap = 0;
-
-    if (content && content->type == JSON_ARRAY) {
-        for (size_t i = 0; i < content->array.count; i++) {
-            JsonValue *block = content->array.items[i];
-            const char *btype = json_get_string(block, "type");
-            if (!btype) continue;
-
-            ContentPart *cp = calloc(1, sizeof(ContentPart));
-
-            if (strcmp(btype, "text") == 0) {
-                const char *t = json_get_string(block, "text");
-                cp->kind = CONTENT_TEXT;
-                cp->text = str_dup(t ? t : "");
-                strbuf_append_cstr(&text_buf, t ? t : "");
-            } else if (strcmp(btype, "tool_use") == 0) {
-                cp->kind = CONTENT_TOOL_CALL;
-                cp->tool_call = calloc(1, sizeof(ToolCallData));
-                cp->tool_call->id = str_dup(json_get_string(block, "id"));
-                cp->tool_call->name = str_dup(json_get_string(block, "name"));
-                JsonValue *input = json_get(block, "input");
-                cp->tool_call->arguments_json = input ? json_serialize(input) : str_dup("{}");
-
-                /* Also add to tool_calls array */
-                if (r->tool_call_count >= tc_cap) {
-                    tc_cap = tc_cap ? tc_cap * 2 : 4;
-                    r->tool_calls = realloc(r->tool_calls, tc_cap * sizeof(ToolCall *));
-                }
-                ToolCall *tc = calloc(1, sizeof(ToolCall));
-                tc->id = str_dup(cp->tool_call->id);
-                tc->name = str_dup(cp->tool_call->name);
-                tc->arguments_json = str_dup(cp->tool_call->arguments_json);
-                r->tool_calls[r->tool_call_count++] = tc;
-            } else if (strcmp(btype, "thinking") == 0) {
-                cp->kind = CONTENT_THINKING;
-                cp->thinking = calloc(1, sizeof(ThinkingData));
-                const char *t = json_get_string(block, "thinking");
-                cp->thinking->text = str_dup(t ? t : "");
-                cp->thinking->signature = str_dup(json_get_string(block, "signature"));
-                strbuf_append_cstr(&reasoning_buf, t ? t : "");
-            } else {
-                content_part_free(cp);
-                continue;
-            }
-
-            if (msg->part_count >= parts_cap) {
-                parts_cap = parts_cap ? parts_cap * 2 : 4;
-                msg->parts = realloc(msg->parts, parts_cap * sizeof(ContentPart *));
-            }
-            msg->parts[msg->part_count++] = cp;
-        }
-    }
-
-    r->message = msg;
-    r->text = strbuf_detach(&text_buf);
-    r->reasoning = reasoning_buf.len > 0 ? strbuf_detach(&reasoning_buf) : NULL;
-    if (reasoning_buf.len == 0) strbuf_free(&reasoning_buf);
-
-    /* Finish reason */
-    const char *stop = json_get_string(root, "stop_reason");
-    if (stop) {
-        r->finish_reason.raw = str_dup(stop);
-        if (strcmp(stop, "end_turn") == 0 || strcmp(stop, "stop_sequence") == 0)
-            r->finish_reason.reason = FINISH_STOP;
-        else if (strcmp(stop, "max_tokens") == 0)
-            r->finish_reason.reason = FINISH_LENGTH;
-        else if (strcmp(stop, "tool_use") == 0)
-            r->finish_reason.reason = FINISH_TOOL_CALLS;
-        else
-            r->finish_reason.reason = FINISH_OTHER;
-    }
-
-    /* Usage */
-    JsonValue *usage = json_get(root, "usage");
-    if (usage) {
-        r->usage.input_tokens = json_get_int(usage, "input_tokens", 0);
-        r->usage.output_tokens = json_get_int(usage, "output_tokens", 0);
-        r->usage.total_tokens = r->usage.input_tokens + r->usage.output_tokens;
-        r->usage.cache_read_tokens = json_get_int(usage, "cache_read_input_tokens", -1);
-        r->usage.cache_write_tokens = json_get_int(usage, "cache_creation_input_tokens", -1);
-        r->usage.reasoning_tokens = -1;
-    }
-
-    json_free(root);
-    return r;
+static bool add_part(LlmResponse *r,ContentPart *part) {
+    if(!part || r->message->part_count>=4096) {content_part_free(part);return false;}
+    size_t n=r->message->part_count;
+    ContentPart **parts=mem_reallocarray(r->message->parts,n+1,sizeof(*parts));
+    if(!parts) {content_part_free(part);return false;}r->message->parts=parts;parts[n]=part;r->message->part_count++;
+    if(part->kind==CONTENT_TOOL_CALL) {
+        ToolCallData *data=part->tool_call;if(!data || !data->id || !data->name || !data->arguments_json) return false;
+        ToolCall *call=mem_calloc(1,sizeof(*call));if(!call) return false;
+        call->id=str_dup(data->id);call->name=str_dup(data->name);call->arguments_json=str_dup(data->arguments_json);
+        if(!call->id || !call->name || !call->arguments_json) {tool_call_free(call);return false;}
+        ToolCall **calls=mem_reallocarray(r->tool_calls,r->tool_call_count+1,sizeof(*calls));
+        if(!calls) {tool_call_free(call);return false;}r->tool_calls=calls;calls[r->tool_call_count++]=call;
+    }return true;
 }
-
-static LlmResponse *parse_openai_response(const char *json_str) {
-    const char *e = NULL;
-    JsonValue *root = json_parse(json_str, &e);
-    if (!root) return NULL;
-
-    LlmResponse *r = calloc(1, sizeof(LlmResponse));
-    r->id = str_dup(json_get_string(root, "id"));
-    r->model = str_dup(json_get_string(root, "model"));
-
-    StrBuf text_buf;
-    strbuf_init(&text_buf);
-    size_t tc_cap = 0;
-
-    Message *msg = calloc(1, sizeof(Message));
-    msg->role = ROLE_ASSISTANT;
-    size_t parts_cap = 0;
-
-    /* Parse output array */
-    JsonValue *output = json_get(root, "output");
-    if (output && output->type == JSON_ARRAY) {
-        for (size_t i = 0; i < output->array.count; i++) {
-            JsonValue *item = output->array.items[i];
-            const char *itype = json_get_string(item, "type");
-            if (!itype) continue;
-
-            if (strcmp(itype, "message") == 0) {
-                JsonValue *content = json_get(item, "content");
-                if (content && content->type == JSON_ARRAY) {
-                    for (size_t j = 0; j < content->array.count; j++) {
-                        JsonValue *part = content->array.items[j];
-                        const char *ptype = json_get_string(part, "type");
-                        if (ptype && strcmp(ptype, "output_text") == 0) {
-                            const char *t = json_get_string(part, "text");
-                            ContentPart *cp = calloc(1, sizeof(ContentPart));
-                            cp->kind = CONTENT_TEXT;
-                            cp->text = str_dup(t ? t : "");
-                            strbuf_append_cstr(&text_buf, t ? t : "");
-                            if (msg->part_count >= parts_cap) {
-                                parts_cap = parts_cap ? parts_cap * 2 : 4;
-                                msg->parts = realloc(msg->parts, parts_cap * sizeof(ContentPart *));
-                            }
-                            msg->parts[msg->part_count++] = cp;
-                        }
-                    }
-                }
-            } else if (strcmp(itype, "function_call") == 0) {
-                ContentPart *cp = calloc(1, sizeof(ContentPart));
-                cp->kind = CONTENT_TOOL_CALL;
-                cp->tool_call = calloc(1, sizeof(ToolCallData));
-                /* Responses API: use call_id for referencing in function_call_output */
-                const char *cid = json_get_string(item, "call_id");
-                if (!cid) cid = json_get_string(item, "id");
-                cp->tool_call->id = str_dup(cid);
-                cp->tool_call->name = str_dup(json_get_string(item, "name"));
-                cp->tool_call->arguments_json = str_dup(json_get_string(item, "arguments"));
-                if (msg->part_count >= parts_cap) {
-                    parts_cap = parts_cap ? parts_cap * 2 : 4;
-                    msg->parts = realloc(msg->parts, parts_cap * sizeof(ContentPart *));
-                }
-                msg->parts[msg->part_count++] = cp;
-
-                if (r->tool_call_count >= tc_cap) {
-                    tc_cap = tc_cap ? tc_cap * 2 : 4;
-                    r->tool_calls = realloc(r->tool_calls, tc_cap * sizeof(ToolCall *));
-                }
-                ToolCall *tc = calloc(1, sizeof(ToolCall));
-                tc->id = str_dup(cp->tool_call->id);
-                tc->name = str_dup(cp->tool_call->name);
-                tc->arguments_json = str_dup(cp->tool_call->arguments_json);
-                r->tool_calls[r->tool_call_count++] = tc;
-            }
-        }
-    }
-
-    r->message = msg;
-    r->text = strbuf_detach(&text_buf);
-
-    /* Finish reason */
-    const char *status = json_get_string(root, "status");
-    if (status && strcmp(status, "completed") == 0) {
-        r->finish_reason.reason = r->tool_call_count > 0 ? FINISH_TOOL_CALLS : FINISH_STOP;
-    }
-
-    /* Usage */
-    JsonValue *usage = json_get(root, "usage");
-    if (usage) {
-        r->usage.input_tokens = json_get_int(usage, "input_tokens", 0);
-        r->usage.output_tokens = json_get_int(usage, "output_tokens", 0);
-        r->usage.total_tokens = json_get_int(usage, "total_tokens", 0);
-        r->usage.reasoning_tokens = -1;
-        JsonValue *output_detail = json_get(usage, "output_tokens_details");
-        if (output_detail)
-            r->usage.reasoning_tokens = json_get_int(output_detail, "reasoning_tokens", -1);
-    }
-
-    json_free(root);
-    return r;
+static ContentPart *text_part(const char *text) {
+    if(!text) return NULL;ContentPart *p=mem_calloc(1,sizeof(*p));if(!p) return NULL;
+    p->kind=CONTENT_TEXT;p->text=str_dup(text);if(!p->text) {content_part_free(p);return NULL;}return p;
 }
-
-static LlmResponse *parse_gemini_response(const char *json_str) {
-    const char *e = NULL;
-    JsonValue *root = json_parse(json_str, &e);
-    if (!root) return NULL;
-
-    LlmResponse *r = calloc(1, sizeof(LlmResponse));
-    StrBuf text_buf;
-    strbuf_init(&text_buf);
-    size_t tc_cap = 0;
-
-    Message *msg = calloc(1, sizeof(Message));
-    msg->role = ROLE_ASSISTANT;
-    size_t parts_cap = 0;
-
-    JsonValue *candidates = json_get(root, "candidates");
-    if (candidates && candidates->type == JSON_ARRAY && candidates->array.count > 0) {
-        JsonValue *cand = candidates->array.items[0];
-        JsonValue *content = json_get(cand, "content");
-        JsonValue *parts = content ? json_get(content, "parts") : NULL;
-
-        if (parts && parts->type == JSON_ARRAY) {
-            for (size_t i = 0; i < parts->array.count; i++) {
-                JsonValue *part = parts->array.items[i];
-                ContentPart *cp = calloc(1, sizeof(ContentPart));
-
-                const char *text = json_get_string(part, "text");
-                JsonValue *fc = json_get(part, "functionCall");
-
-                if (text) {
-                    cp->kind = CONTENT_TEXT;
-                    cp->text = str_dup(text);
-                    strbuf_append_cstr(&text_buf, text);
-                } else if (fc) {
-                    cp->kind = CONTENT_TOOL_CALL;
-                    cp->tool_call = calloc(1, sizeof(ToolCallData));
-                    cp->tool_call->name = str_dup(json_get_string(fc, "name"));
-                    JsonValue *args = json_get(fc, "args");
-                    cp->tool_call->arguments_json = args ? json_serialize(args) : str_dup("{}");
-                    /* Generate synthetic ID */
-                    char syn_id[64];
-                    snprintf(syn_id, sizeof(syn_id), "call_%zu", i);
-                    cp->tool_call->id = str_dup(syn_id);
-
-                    if (r->tool_call_count >= tc_cap) {
-                        tc_cap = tc_cap ? tc_cap * 2 : 4;
-                        r->tool_calls = realloc(r->tool_calls, tc_cap * sizeof(ToolCall *));
-                    }
-                    ToolCall *tc = calloc(1, sizeof(ToolCall));
-                    tc->id = str_dup(cp->tool_call->id);
-                    tc->name = str_dup(cp->tool_call->name);
-                    tc->arguments_json = str_dup(cp->tool_call->arguments_json);
-                    r->tool_calls[r->tool_call_count++] = tc;
-                } else {
-                    content_part_free(cp);
-                    continue;
-                }
-
-                if (msg->part_count >= parts_cap) {
-                    parts_cap = parts_cap ? parts_cap * 2 : 4;
-                    msg->parts = realloc(msg->parts, parts_cap * sizeof(ContentPart *));
-                }
-                msg->parts[msg->part_count++] = cp;
-            }
-        }
-
-        const char *finish = json_get_string(cand, "finishReason");
-        if (finish) {
-            r->finish_reason.raw = str_dup(finish);
-            if (strcmp(finish, "STOP") == 0)
-                r->finish_reason.reason = r->tool_call_count > 0 ? FINISH_TOOL_CALLS : FINISH_STOP;
-            else if (strcmp(finish, "MAX_TOKENS") == 0)
-                r->finish_reason.reason = FINISH_LENGTH;
-            else if (strcmp(finish, "SAFETY") == 0 || strcmp(finish, "RECITATION") == 0)
-                r->finish_reason.reason = FINISH_CONTENT_FILTER;
-            else
-                r->finish_reason.reason = FINISH_OTHER;
-        }
-    }
-
-    r->message = msg;
-    r->text = strbuf_detach(&text_buf);
-
-    /* Usage */
-    JsonValue *usage_meta = json_get(root, "usageMetadata");
-    if (usage_meta) {
-        r->usage.input_tokens = json_get_int(usage_meta, "promptTokenCount", 0);
-        r->usage.output_tokens = json_get_int(usage_meta, "candidatesTokenCount", 0);
-        r->usage.total_tokens = r->usage.input_tokens + r->usage.output_tokens;
-        r->usage.reasoning_tokens = json_get_int(usage_meta, "thoughtsTokenCount", -1);
-        r->usage.cache_read_tokens = json_get_int(usage_meta, "cachedContentTokenCount", -1);
-        r->usage.cache_write_tokens = -1;
-    }
-
-    json_free(root);
-    return r;
+static ContentPart *tool_part(const char *id,const char *name,const char *arguments) {
+    if(!id || !name || !arguments) return NULL;ContentPart *p=mem_calloc(1,sizeof(*p));if(!p) return NULL;
+    p->kind=CONTENT_TOOL_CALL;p->tool_call=mem_calloc(1,sizeof(*p->tool_call));if(!p->tool_call) goto fail;
+    p->tool_call->id=str_dup(id);p->tool_call->name=str_dup(name);p->tool_call->arguments_json=str_dup(arguments);
+    if(!p->tool_call->id || !p->tool_call->name || !p->tool_call->arguments_json) goto fail;return p;
+fail:content_part_free(p);return NULL;
 }
+static bool usage_value(const JsonValue *j,const char *key,int *out,int fallback) {
+    JsonValue *v=json_get(j,key);if(!v) {*out=fallback;return true;}
+    int n=json_get_int(j,key,-2);if(n<0) return false;*out=n;return true;
+}
+static LlmResponse *parse_response(const char *provider,const char *source) {
+    unsigned long failures=mem_failure_count();JsonValue *root=json_parse(source,NULL);if(!root || root->type!=JSON_OBJECT) {json_free(root);return NULL;}
+    LlmResponse *r=mem_calloc(1,sizeof(*r));if(!r) {json_free(root);return NULL;}
+    r->message=message_assistant(NULL);if(!r->message) goto fail;
+    r->id=str_dup(json_get_string(root,"id"));r->model=str_dup(json_get_string(root,"model"));
+    JsonValue *items=NULL,*usage=NULL;const char *finish=NULL;
+    if(str_eq(provider,"anthropic")) {items=json_get(root,"content");finish=json_get_string(root,"stop_reason");usage=json_get(root,"usage");}
+    else if(str_eq(provider,"openai")) {items=json_get(root,"output");finish=json_get_string(root,"status");usage=json_get(root,"usage");}
+    else {
+        JsonValue *candidate=json_array_get(json_get(root,"candidates"),0);
+        items=json_get(json_get(candidate,"content"),"parts");finish=json_get_string(candidate,"finishReason");usage=json_get(root,"usageMetadata");
+    }
+    if(!items || items->type!=JSON_ARRAY || items->array.count>4096 || !finish || !*finish) goto fail;
+    StrBuf reasoning;strbuf_init(&reasoning);
+    for(size_t i=0;i<items->array.count;i++) {
+        JsonValue *item=items->array.items[i];if(item->type!=JSON_OBJECT) {strbuf_free(&reasoning);goto fail;}
+        const char *type=json_get_string(item,"type");ContentPart *part=NULL;
+        if(str_eq(provider,"anthropic")) {
+            if(str_eq(type,"text")) part=text_part(json_get_string(item,"text"));
+            else if(str_eq(type,"tool_use")) {
+                char *args=json_serialize(json_get(item,"input"));part=tool_part(json_get_string(item,"id"),json_get_string(item,"name"),args);free(args);
+            } else if(str_eq(type,"thinking") || str_eq(type,"redacted_thinking")) {
+                part=mem_calloc(1,sizeof(*part));if(!part) {strbuf_free(&reasoning);goto fail;}
+                part->kind=str_eq(type,"thinking")?CONTENT_THINKING:CONTENT_REDACTED_THINKING;
+                part->thinking=mem_calloc(1,sizeof(*part->thinking));if(!part->thinking) {content_part_free(part);strbuf_free(&reasoning);goto fail;}
+                part->thinking->redacted=part->kind==CONTENT_REDACTED_THINKING;
+                part->thinking->text=str_dup(json_get_string(item,part->thinking->redacted?"data":"thinking"));part->thinking->signature=str_dup(json_get_string(item,"signature"));
+                if(!part->thinking->text) {content_part_free(part);strbuf_free(&reasoning);goto fail;}
+                if(!part->thinking->redacted) strbuf_append_cstr(&reasoning,part->thinking->text);
+            }
+        } else if(str_eq(provider,"openai")) {
+            if(str_eq(type,"message")) {
+                JsonValue *content=json_get(item,"content");if(!content || content->type!=JSON_ARRAY) {strbuf_free(&reasoning);goto fail;}
+                for(size_t k=0;k<content->array.count;k++) {
+                    JsonValue *v=content->array.items[k];if(!str_eq(json_get_string(v,"type"),"output_text") || !add_part(r,text_part(json_get_string(v,"text")))) {strbuf_free(&reasoning);goto fail;}
+                }continue;
+            } else if(str_eq(type,"function_call")) part=tool_part(json_get_string(item,"call_id"),json_get_string(item,"name"),json_get_string(item,"arguments"));
+            else if(str_eq(type,"reasoning")) {
+                /* Preserve opaque provider reasoning item for subsequent requests. */
+                part=mem_calloc(1,sizeof(*part));if(!part) {strbuf_free(&reasoning);goto fail;}
+                part->kind=CONTENT_THINKING;part->thinking=mem_calloc(1,sizeof(*part->thinking));
+                if(!part->thinking) {content_part_free(part);strbuf_free(&reasoning);goto fail;}
+                part->thinking->signature=json_serialize(item);part->thinking->text=str_dup("");
+            }
+        } else {
+            const char *text=json_get_string(item,"text");JsonValue *call=json_get(item,"functionCall");
+            if(text && json_get_bool(item,"thought",false)) {
+                part=mem_calloc(1,sizeof(*part));if(part) {
+                    part->kind=CONTENT_THINKING;part->thinking=mem_calloc(1,sizeof(*part->thinking));
+                    if(part->thinking) {part->thinking->text=str_dup(text);strbuf_append_cstr(&reasoning,text);}
+                    else {content_part_free(part);part=NULL;}
+                }
+            } else if(text) part=text_part(text);
+            else if(call) {
+                char id[64];snprintf(id,sizeof(id),"call_%zu",i);char *args=json_serialize(json_get(call,"args"));
+                part=tool_part(id,json_get_string(call,"name"),args);free(args);
+            }
+            if(part) part->provider_metadata_json=json_serialize(item);
+        }
+        if(!add_part(r,part)) {strbuf_free(&reasoning);goto fail;}
+    }
+    r->reasoning=reasoning.len?strbuf_detach(&reasoning):NULL;strbuf_free(&reasoning);
+    r->text=message_text(r->message);if(!r->text) goto fail;
+    r->finish_reason.raw=str_dup(finish);r->finish_reason.reason=FINISH_OTHER;
+    if(str_eq(finish,"end_turn") || str_eq(finish,"stop_sequence") || str_eq(finish,"completed") || str_eq(finish,"STOP")) r->finish_reason.reason=r->tool_call_count?FINISH_TOOL_CALLS:FINISH_STOP;
+    else if(str_eq(finish,"tool_use")) r->finish_reason.reason=FINISH_TOOL_CALLS;
+    else if(str_eq(finish,"max_tokens") || str_eq(finish,"MAX_TOKENS") || str_eq(finish,"incomplete")) r->finish_reason.reason=FINISH_LENGTH;
+    else if(str_eq(finish,"SAFETY") || str_eq(finish,"RECITATION")) r->finish_reason.reason=FINISH_CONTENT_FILTER;
+    else if(str_eq(finish,"failed") || str_eq(finish,"cancelled")) goto fail;
+    if(!usage_value(usage,str_eq(provider,"gemini")?"promptTokenCount":"input_tokens",&r->usage.input_tokens,0) ||
+       !usage_value(usage,str_eq(provider,"gemini")?"candidatesTokenCount":"output_tokens",&r->usage.output_tokens,0)) goto fail;
+    r->usage.total_tokens=usage_add((Usage){.total_tokens=r->usage.input_tokens},(Usage){.total_tokens=r->usage.output_tokens}).total_tokens;
+    r->usage.reasoning_tokens=r->usage.cache_read_tokens=r->usage.cache_write_tokens=-1;
+    if(str_eq(provider,"anthropic")) {
+        if(!usage_value(usage,"cache_read_input_tokens",&r->usage.cache_read_tokens,-1) || !usage_value(usage,"cache_creation_input_tokens",&r->usage.cache_write_tokens,-1)) goto fail;
+    } else if(str_eq(provider,"openai")) {
+        if(!usage_value(json_get(usage,"input_tokens_details"),"cached_tokens",&r->usage.cache_read_tokens,-1) || !usage_value(json_get(usage,"output_tokens_details"),"reasoning_tokens",&r->usage.reasoning_tokens,-1)) goto fail;
+    } else if(!usage_value(usage,"thoughtsTokenCount",&r->usage.reasoning_tokens,-1) || !usage_value(usage,"cachedContentTokenCount",&r->usage.cache_read_tokens,-1)) goto fail;
+    if(mem_failure_count()!=failures) goto fail;json_free(root);return r;
+fail:json_free(root);llm_response_free(r);return NULL;
+}
+static LlmResponse *parse_anthropic_response(const char *source) {return parse_response("anthropic",source);}
+static LlmResponse *parse_openai_response(const char *source) {return parse_response("openai",source);}
+static LlmResponse *parse_gemini_response(const char *source) {return parse_response("gemini",source);}

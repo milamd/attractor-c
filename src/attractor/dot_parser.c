@@ -7,6 +7,10 @@
 
 #include "attractor/dot_parser.h"
 #include "util/str.h"
+#include "util/mem.h"
+#include "util/io.h"
+#include <errno.h>
+#include <limits.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +93,8 @@ typedef struct {
     DefaultAttrs  edge_defaults;
     char         *graph_name;
     char         *err;
+    bool          failed;
+    unsigned      depth;
 } Parser;
 
 /*============================================================================
@@ -190,7 +196,8 @@ static Token lex_string(Lexer *l) {
             l->pos++;
         }
     }
-    if (l->pos < l->len) l->pos++; /* skip closing " */
+    if(l->pos>=l->len) {strbuf_free(&sb);l->err=str_dup("unterminated quoted string");return (Token){.kind=TOK_ERROR};}
+    l->pos++;
     Token t = { .kind = TOK_STRING, .text = strbuf_detach(&sb) };
     return t;
 }
@@ -219,6 +226,7 @@ static Token lex_ident(Lexer *l) {
 }
 
 static Token lex_next(Lexer *l) {
+    if(l->err) return (Token){.kind=TOK_ERROR};
     lex_skip_ws(l);
     if (l->pos >= l->len) {
         Token t = { .kind = TOK_EOF, .text = NULL };
@@ -258,6 +266,7 @@ static Token lex_next(Lexer *l) {
         StrBuf sb;
         strbuf_init(&sb);
         strbuf_appendf(&sb, "unexpected character '%c'", c);
+        free(l->err);
         l->err = strbuf_detach(&sb);
         Token t = { .kind = TOK_ERROR, .text = NULL };
         return t;
@@ -281,7 +290,8 @@ static void tok_free(Token *t) {
 static void parser_advance(Parser *p) {
     tok_free(&p->cur);
     p->cur = lex_next(&p->lex);
-    if (p->cur.kind == TOK_ERROR && !p->err) {
+    if(p->cur.kind!=TOK_EOF && !p->cur.text) p->failed=true;
+    if (p->cur.kind == TOK_ERROR && !p->err && !p->failed) {
         p->err = p->lex.err;
         p->lex.err = NULL;
     }
@@ -309,6 +319,7 @@ static void parser_skip_semi(Parser *p) {
 }
 
 static void parser_error(Parser *p, const char *msg) {
+    p->failed=true;
     if (!p->err)
         p->err = str_dup(msg);
 }
@@ -325,8 +336,10 @@ static void attrlist_init(AttrList *al) {
 
 static void attrlist_add(AttrList *al, const char *key, const char *value) {
     if (al->count == al->cap) {
-        al->cap = al->cap ? al->cap * 2 : 8;
-        al->items = realloc(al->items, al->cap * sizeof(Attr));
+        size_t cap=al->cap?al->cap*2:8;
+        Attr *items=mem_reallocarray(al->items,cap,sizeof(*items));
+        if(!items) return ;
+        al->items=items;al->cap=cap;
     }
     al->items[al->count].key   = str_dup(key);
     al->items[al->count].value = str_dup(value);
@@ -359,8 +372,10 @@ static void defaultattrs_add(DefaultAttrs *d, const char *key, const char *value
         }
     }
     if (d->count == d->cap) {
-        d->cap = d->cap ? d->cap * 2 : 8;
-        d->items = realloc(d->items, d->cap * sizeof(Attr));
+        size_t cap=d->cap?d->cap*2:8;
+        Attr *items=mem_reallocarray(d->items,cap,sizeof(*items));
+        if(!items) return ;
+        d->items=items;d->cap=cap;
     }
     d->items[d->count].key   = str_dup(key);
     d->items[d->count].value = str_dup(value);
@@ -384,9 +399,12 @@ static void nodelist_init(NodeList *nl) {
 }
 
 static DotNode *nodelist_add(NodeList *nl) {
+    if(nl->count>=10000) return NULL;
     if (nl->count == nl->cap) {
-        nl->cap = nl->cap ? nl->cap * 2 : 16;
-        nl->items = realloc(nl->items, nl->cap * sizeof(DotNode));
+        size_t cap=nl->cap?nl->cap*2:16;
+        DotNode *items=mem_reallocarray(nl->items,cap,sizeof(*items));
+        if(!items) return NULL;
+        nl->items=items;nl->cap=cap;
     }
     DotNode *n = &nl->items[nl->count++];
     memset(n, 0, sizeof(*n));
@@ -400,9 +418,12 @@ static void edgelist_init(EdgeList *el) {
 }
 
 static DotEdge *edgelist_add(EdgeList *el) {
+    if(el->count>=100000) return NULL;
     if (el->count == el->cap) {
-        el->cap = el->cap ? el->cap * 2 : 16;
-        el->items = realloc(el->items, el->cap * sizeof(DotEdge));
+        size_t cap=el->cap?el->cap*2:16;
+        DotEdge *items=mem_reallocarray(el->items,cap,sizeof(*items));
+        if(!items) return NULL;
+        el->items=items;el->cap=cap;
     }
     DotEdge *e = &el->items[el->count++];
     memset(e, 0, sizeof(*e));
@@ -416,7 +437,7 @@ static DotEdge *edgelist_add(EdgeList *el) {
 static void parse_attr_block(Parser *p, AttrList *attrs) {
     if (!parser_consume(p, TOK_LBRACKET)) return;
 
-    while (!parser_at(p, TOK_RBRACKET) && !parser_at(p, TOK_EOF) && !p->err) {
+    while (!parser_at(p, TOK_RBRACKET) && !parser_at(p, TOK_EOF) && !p->err && !p->failed) {
         /* Key: may be qualified (e.g. llm.model) */
         if (!parser_at(p, TOK_IDENT) && !parser_at(p, TOK_STRING)) {
             parser_error(p, "expected attribute key");
@@ -441,6 +462,7 @@ static void parse_attr_block(Parser *p, AttrList *attrs) {
             }
         }
         char *key = strbuf_detach(&keybuf);
+        if(!key) {parser_error(p,"Attribute allocation failed");return;}
 
         if (!parser_consume(p, TOK_EQUALS)) {
             parser_error(p, "expected '=' in attribute");
@@ -479,6 +501,7 @@ static DotNode *find_or_create_node(Parser *p, const char *id) {
             return &p->nodes.items[i];
     }
     DotNode *n = nodelist_add(&p->nodes);
+    if(!n) {parser_error(p,"Node allocation failed");return NULL;}
     n->id = str_dup(id);
     return n;
 }
@@ -491,8 +514,8 @@ static void merge_attrs_into_node(DotNode *n, const AttrList *al) {
     for (size_t i = 0; i < al->count; i++) {
         /* Grow node's attrs array */
         size_t idx = n->attr_count;
-        n->attr_count++;
-        n->attrs = realloc(n->attrs, n->attr_count * sizeof(Attr));
+        Attr *items=mem_reallocarray(n->attrs,n->attr_count+1,sizeof(*items));
+        if(!items) return;n->attrs=items;n->attr_count++;
         n->attrs[idx].key   = str_dup(al->items[i].key);
         n->attrs[idx].value = str_dup(al->items[i].value);
     }
@@ -546,7 +569,7 @@ static void parse_subgraph(Parser *p, const DefaultAttrs *parent_node_defaults) 
         str_lower(tmp);
         StrBuf cls;
         strbuf_init(&cls);
-        for (size_t i = 0; tmp[i]; i++) {
+        for (size_t i = 0; tmp && tmp[i]; i++) {
             char c = tmp[i];
             if (c == ' ' || c == '_')
                 strbuf_append(&cls, "-", 1);
@@ -557,7 +580,8 @@ static void parse_subgraph(Parser *p, const DefaultAttrs *parent_node_defaults) 
         scope_class = strbuf_detach(&cls);
     }
 
-    parse_statements(p, &scoped, scope_class);
+    if(p->depth>=64) parser_error(p,"DOT subgraph nesting limit");
+    else {p->depth++;parse_statements(p, &scoped, scope_class);p->depth--;}
 
     if (!parser_consume(p, TOK_RBRACE)) {
         parser_error(p, "expected '}' closing subgraph");
@@ -585,7 +609,7 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
                              p->node_defaults.items[i].value);
     }
 
-    while (!parser_at(p, TOK_RBRACE) && !parser_at(p, TOK_EOF) && !p->err) {
+    while (!parser_at(p, TOK_RBRACE) && !parser_at(p, TOK_EOF) && !p->err && !p->failed) {
         parser_skip_semi(p);
         if (parser_at(p, TOK_RBRACE) || parser_at(p, TOK_EOF)) break;
 
@@ -659,10 +683,11 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
                            p->cur.text ? p->cur.text : "<null>");
             parser_error(p, sb.data);
             strbuf_free(&sb);
-            return;
+            goto done;
         }
 
         char *first_id = str_dup(p->cur.text);
+        if(!first_id) {parser_error(p,"Identifier allocation failed");goto done;}
         parser_advance(p);
 
         /* Graph-level attr: identifier '=' value (not inside bracket) */
@@ -685,7 +710,8 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
             /* Collect chain of node ids */
             size_t id_cap = 8;
             size_t id_count = 1;
-            char **ids = malloc(id_cap * sizeof(char *));
+            char **ids = mem_calloc(id_cap,sizeof(char *));
+            if(!ids) {free(first_id);parser_error(p,"Chain allocation failed");goto done;}
             ids[0] = first_id;
 
             while (parser_at(p, TOK_ARROW)) {
@@ -694,11 +720,14 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
                     parser_error(p, "expected node id after '->'");
                     for (size_t i = 0; i < id_count; i++) free(ids[i]);
                     free(ids);
-                    return;
+                    goto done;
                 }
                 if (id_count == id_cap) {
                     id_cap *= 2;
-                    ids = realloc(ids, id_cap * sizeof(char *));
+                    char **items=mem_reallocarray(ids,id_cap,sizeof(*items));
+                    if(!items) {
+                        for(size_t k=0;k<id_count;k++) free(ids[k]);free(ids);parser_error(p,"Chain allocation failed");goto done;
+                    }ids=items;
                 }
                 ids[id_count++] = str_dup(p->cur.text);
                 parser_advance(p);
@@ -713,6 +742,7 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
             /* Ensure all endpoint nodes exist */
             for (size_t i = 0; i < id_count; i++) {
                 DotNode *n = find_or_create_node(p, ids[i]);
+                if(!n) break;
                 /* If the node has no attrs yet and we have scope class, assign it */
                 if (scope_class && !n->class_attr) {
                     n->class_attr = str_dup(scope_class);
@@ -720,23 +750,26 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
             }
 
             /* Create one edge per consecutive pair */
-            for (size_t i = 0; i + 1 < id_count; i++) {
+            for (size_t i = 0; i + 1 < id_count && !p->failed; i++) {
                 DotEdge *e = edgelist_add(&p->edges);
+                if(!e) {parser_error(p,"Edge allocation failed");break;}
                 e->from = str_dup(ids[i]);
                 e->to   = str_dup(ids[i + 1]);
 
                 /* Apply edge defaults */
                 for (size_t d = 0; d < p->edge_defaults.count; d++) {
-                    size_t idx = e->attr_count++;
-                    e->attrs = realloc(e->attrs, e->attr_count * sizeof(Attr));
+                    size_t idx=e->attr_count;
+                    Attr *items=mem_reallocarray(e->attrs,e->attr_count+1,sizeof(*items));
+                    if(!items) {parser_error(p,"Edge attributes allocation failed");break;}e->attrs=items;e->attr_count++;
                     e->attrs[idx].key   = str_dup(p->edge_defaults.items[d].key);
                     e->attrs[idx].value = str_dup(p->edge_defaults.items[d].value);
                 }
 
                 /* Apply explicit attrs (will override defaults on resolve) */
                 for (size_t a = 0; a < edge_attrs.count; a++) {
-                    size_t idx = e->attr_count++;
-                    e->attrs = realloc(e->attrs, e->attr_count * sizeof(Attr));
+                    size_t idx=e->attr_count;
+                    Attr *items=mem_reallocarray(e->attrs,e->attr_count+1,sizeof(*items));
+                    if(!items) {parser_error(p,"Edge attributes allocation failed");break;}e->attrs=items;e->attr_count++;
                     e->attrs[idx].key   = str_dup(edge_attrs.items[a].key);
                     e->attrs[idx].value = str_dup(edge_attrs.items[a].value);
                 }
@@ -752,6 +785,7 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
         /* Node statement: NodeId [attrs]? ;? */
         {
             DotNode *node = find_or_create_node(p, first_id);
+            if(!node) {free(first_id);goto done;}
 
             /* Apply scope class if set and node doesn't have one yet */
             if (scope_class && !node->class_attr) {
@@ -778,6 +812,7 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
         }
     }
 
+done:
     defaultattrs_free(&local_nd);
 }
 
@@ -799,8 +834,8 @@ static const char *attrs_find_last(const Attr *attrs, size_t count,
 static int parse_int(const char *s, int def) {
     if (!s) return def;
     char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (end == s) return def;
+    errno=0;long v = strtol(s, &end, 10);
+    if(end==s || *end || errno==ERANGE || v<INT_MIN || v>INT_MAX) return def;
     return (int)v;
 }
 
@@ -936,14 +971,18 @@ static void resolve_graph_attrs(DotGraph *g, const AttrList *ga) {
  * Public API: dot_parse
  *==========================================================================*/
 
+static void dot_graph_clear(DotGraph *g);
+
 DotGraph *dot_parse(const char *source, char **err_msg) {
-    if (!source) {
+    unsigned long failures=mem_failure_count();
+    if (!source || strnlen(source,ATTRACTOR_INPUT_LIMIT+1)>ATTRACTOR_INPUT_LIMIT) {
         if (err_msg) *err_msg = str_dup("null source");
         return NULL;
     }
 
     /* Phase 1: strip comments */
     char *clean = strip_comments(source);
+    if(!clean) {if(err_msg) *err_msg=str_dup("DOT allocation/size limit");return NULL;}
 
     /* Phase 2: tokenize + parse */
     Parser p;
@@ -957,6 +996,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
 
     /* Read first token */
     p.cur = lex_next(&p.lex);
+    if(p.cur.kind!=TOK_EOF && !p.cur.text) p.failed=true;
 
     /* Expect: 'digraph' */
     if (!parser_at_ident_val(&p, "digraph")) {
@@ -976,7 +1016,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
     }
 
     /* Parse statements (top-level scope: no parent defaults, no scope class) */
-    if (!p.err) {
+    if (!p.err && !p.failed) {
         parse_statements(&p, NULL, NULL);
     }
 
@@ -985,8 +1025,9 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
         parser_error(&p, "expected '}' at end of digraph");
     }
 
+    if(!p.err && !p.failed && !parser_at(&p,TOK_EOF)) parser_error(&p,"Trailing DOT input");
     /* Check for errors */
-    if (p.err) {
+    if (p.err || p.failed || mem_failure_count()!=failures) {
         if (err_msg) *err_msg = p.err;
         else free(p.err);
 
@@ -1034,6 +1075,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
         defaultattrs_free(&p.edge_defaults);
         free(p.graph_name);
         tok_free(&p.cur);
+        free(p.lex.err);
         free(clean);
         return NULL;
     }
@@ -1046,7 +1088,13 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
         resolve_edge(&p.edges.items[i]);
 
     /* Phase 4: build the graph */
-    DotGraph *g = calloc(1, sizeof(DotGraph));
+    DotGraph *g = mem_calloc(1, sizeof(DotGraph));
+    if(!g) {
+        DotGraph partial={.name=p.graph_name,.nodes=p.nodes.items,.node_count=p.nodes.count,.edges=p.edges.items,.edge_count=p.edges.count};
+        attrlist_free_contents(&p.graph_attrs);defaultattrs_free(&p.node_defaults);defaultattrs_free(&p.edge_defaults);tok_free(&p.cur);free(clean);
+        /* Allocation-free graph destruction supports stack storage internally. */
+        dot_graph_clear(&partial);return NULL;
+    }
     g->name       = p.graph_name;
     g->nodes      = p.nodes.items;
     g->node_count = p.nodes.count;
@@ -1062,6 +1110,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
     tok_free(&p.cur);
     free(clean);
 
+    if(mem_failure_count()!=failures) {dot_graph_free(g);if(err_msg) *err_msg=str_dup("DOT allocation failure");return NULL;}
     if (err_msg) *err_msg = NULL;
     return g;
 }
@@ -1070,7 +1119,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
  * Public API: dot_graph_free
  *==========================================================================*/
 
-void dot_graph_free(DotGraph *g) {
+static void dot_graph_clear(DotGraph *g) {
     if (!g) return;
 
     free(g->name);
@@ -1123,8 +1172,9 @@ void dot_graph_free(DotGraph *g) {
     }
     free(g->edges);
 
-    free(g);
+    memset(g,0,sizeof(*g));
 }
+void dot_graph_free(DotGraph *g) {if(g) {dot_graph_clear(g);free(g);}}
 
 /*============================================================================
  * Public API: dot_find_node
@@ -1145,11 +1195,11 @@ DotNode *dot_find_node(const DotGraph *g, const char *id) {
 
 size_t dot_outgoing_edges(const DotGraph *g, const char *node_id,
                           const DotEdge **out, size_t max) {
-    if (!g || !node_id || !out || max == 0) return 0;
+    if (!g || !node_id) return 0;
     size_t found = 0;
-    for (size_t i = 0; i < g->edge_count && found < max; i++) {
+    for (size_t i = 0; i < g->edge_count; i++) {
         if (str_eq(g->edges[i].from, node_id))
-            out[found++] = &g->edges[i];
+            {if(out && found<max) out[found]=&g->edges[i];found++;}
     }
     return found;
 }
@@ -1160,11 +1210,11 @@ size_t dot_outgoing_edges(const DotGraph *g, const char *node_id,
 
 size_t dot_incoming_edges(const DotGraph *g, const char *node_id,
                           const DotEdge **out, size_t max) {
-    if (!g || !node_id || !out || max == 0) return 0;
+    if (!g || !node_id) return 0;
     size_t found = 0;
-    for (size_t i = 0; i < g->edge_count && found < max; i++) {
+    for (size_t i = 0; i < g->edge_count; i++) {
         if (str_eq(g->edges[i].to, node_id))
-            out[found++] = &g->edges[i];
+            {if(out && found<max) out[found]=&g->edges[i];found++;}
     }
     return found;
 }
@@ -1191,4 +1241,15 @@ const char *dot_edge_attr(const DotEdge *e, const char *key, const char *def) {
             return e->attrs[i - 1].value;
     }
     return def;
+}
+
+const char *dot_node_role(const DotNode *n) {
+    if(n->type && *n->type) return n->type;
+    const char *shapes[]={"Mdiamond","Msquare","box","hexagon","diamond","component","tripleoctagon","parallelogram","house"};
+    const char *roles[]={"start","exit","codergen","wait.human","conditional","parallel","parallel.fan_in","tool","stack.manager_loop"};
+    for(size_t i=0;i<sizeof(shapes)/sizeof(*shapes);i++) if(str_eq(n->shape,shapes[i])) return roles[i];
+    if(str_eq(n->id,"start") || str_eq(n->id,"Start")) return "start";
+    if(str_eq(n->id,"exit") || str_eq(n->id,"Exit") || str_eq(n->id,"end") || str_eq(n->id,"End")) return "exit";
+    if(!n->shape || !*n->shape || str_eq(n->shape,"rect") || str_eq(n->shape,"rectangle")) return "codergen";
+    return "unsupported";
 }

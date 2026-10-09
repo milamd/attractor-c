@@ -1,4 +1,8 @@
 #include "util/str.h"
+#include "util/mem.h"
+#include "util/io.h"
+#include <stdint.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -7,32 +11,36 @@
 
 /*--- StrBuf ---*/
 
-void strbuf_init(StrBuf *sb) {
-    sb->data = NULL;
-    sb->len = 0;
-    sb->cap = 0;
+void strbuf_init_limit(StrBuf *sb, size_t limit) {
+    *sb = (StrBuf){.limit=limit};
 }
-
+void strbuf_init(StrBuf *sb) {strbuf_init_limit(sb, ATTRACTOR_INPUT_LIMIT);}
 void strbuf_free(StrBuf *sb) {
-    free(sb->data);
-    sb->data = NULL;
-    sb->len = sb->cap = 0;
+    free(sb->data); *sb=(StrBuf){.limit=sb->limit};
 }
-
-static void strbuf_grow(StrBuf *sb, size_t need) {
-    if (sb->len + need + 1 <= sb->cap) return;
-    size_t newcap = sb->cap ? sb->cap * 2 : 256;
-    while (newcap < sb->len + need + 1) newcap *= 2;
-    sb->data = realloc(sb->data, newcap);
-    sb->cap = newcap;
+static bool strbuf_grow(StrBuf *sb, size_t need) {
+    size_t len, total;
+    if (sb->failed) return false;
+    if (!size_add(sb->len, need, &len) || len > sb->limit || !size_add(len,1,&total)) {
+        sb->failed=true; errno=EOVERFLOW; return false;
+    }
+    if(total <= sb->cap) return true;
+    size_t cap=sb->cap?sb->cap:256;
+    while(cap<total) {if(cap>SIZE_MAX/2) {cap=total;break;} cap*=2;}
+    char *data=mem_reallocarray(sb->data,cap,1);
+    if(!data) {sb->failed=true;return false;}
+    sb->data=data;sb->cap=cap;return true;
 }
-
-void strbuf_append(StrBuf *sb, const char *s, size_t n) {
-    if (!s || n == 0) return;
-    strbuf_grow(sb, n);
-    memcpy(sb->data + sb->len, s, n);
-    sb->len += n;
-    sb->data[sb->len] = '\0';
+void strbuf_append(StrBuf *sb,const char *s,size_t n) {
+    if(!s || !n) return;
+    /* Resolve self-alias before growth can move the allocation. */
+    uintptr_t address=(uintptr_t)s, begin=(uintptr_t)sb->data;
+    bool alias=sb->data && address>=begin && address-begin<=sb->len;
+    size_t offset=alias?(size_t)(address-begin):0;
+    if(alias && n>sb->len-offset) {sb->failed=true;return;}
+    if(!strbuf_grow(sb,n)) return;
+    if(alias) s=sb->data+offset;
+    memmove(sb->data+sb->len,s,n);sb->len+=n;sb->data[sb->len]=0;
 }
 
 void strbuf_append_cstr(StrBuf *sb, const char *s) {
@@ -47,16 +55,16 @@ void strbuf_appendf(StrBuf *sb, const char *fmt, ...) {
     va_copy(ap2, ap);
     int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    if (n < 0) { va_end(ap2); return; }
-    strbuf_grow(sb, (size_t)n);
+    if (n < 0 || !strbuf_grow(sb, (size_t)n)) { sb->failed=true; va_end(ap2); return; }
     vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap2);
     sb->len += (size_t)n;
     va_end(ap2);
 }
 
 char *strbuf_detach(StrBuf *sb) {
+    if (sb->failed) {strbuf_free(sb); return NULL;}
     char *r = sb->data;
-    if (!r) { r = calloc(1, 1); }
+    if (!r) { r = mem_calloc(1, 1); }
     sb->data = NULL;
     sb->len = sb->cap = 0;
     return r;
@@ -72,14 +80,20 @@ void strbuf_reset(StrBuf *sb) {
 char *str_dup(const char *s) {
     if (!s) return NULL;
     size_t n = strlen(s);
-    char *r = malloc(n + 1);
+    size_t bytes;
+    if(!size_add(n,1,&bytes)) return NULL;
+    char *r = mem_alloc(bytes);
+    if(!r) return NULL;
     memcpy(r, s, n + 1);
     return r;
 }
 
 char *str_ndup(const char *s, size_t n) {
     if (!s) return NULL;
-    char *r = malloc(n + 1);
+    size_t bytes;
+    if(!size_add(n,1,&bytes)) return NULL;
+    char *r = mem_alloc(bytes);
+    if(!r) return NULL;
     memcpy(r, s, n);
     r[n] = '\0';
     return r;
@@ -147,12 +161,15 @@ size_t str_split(const char *s, char delim, char ***out) {
     for (const char *p = s; *p; p++) {
         if (*p == delim) count++;
     }
-    *out = malloc(count * sizeof(char *));
+    *out = mem_calloc(count, sizeof(char *));
+    if(!*out) return 0;
     size_t idx = 0;
     const char *start = s;
     for (const char *p = s; ; p++) {
         if (*p == delim || *p == '\0') {
-            (*out)[idx++] = str_ndup(start, (size_t)(p - start));
+            (*out)[idx] = str_ndup(start, (size_t)(p - start));
+            if(!(*out)[idx]) {str_split_free(*out,idx);*out=NULL;return 0;}
+            idx++;
             if (*p == '\0') break;
             start = p + 1;
         }
