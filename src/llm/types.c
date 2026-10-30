@@ -119,8 +119,7 @@ void stream_event_free(StreamEvent *ev) {
     free(ev->delta);
     free(ev->reasoning_delta);
     if (ev->tool_call) tool_call_free(ev->tool_call);
-    if (ev->finish_reason) { free(ev->finish_reason->raw); free(ev->finish_reason); }
-    if (ev->usage) free(ev->usage);
+    free(ev->finish_reason.raw);
     if (ev->response) llm_response_free(ev->response);
     free(ev->error_message);
     free(ev->raw_json);

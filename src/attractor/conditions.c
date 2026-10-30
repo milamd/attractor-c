@@ -2,20 +2,26 @@
 #include "util/str.h"
 #include <ctype.h>
 #include <string.h>
-#include <stdlib.h>
 typedef struct {
     const char *s;size_t pos,depth;bool valid;
     const Outcome *outcome;const PipelineContext *context;
 } ConditionParser;
 static void space(ConditionParser *p) {while(isspace((unsigned char)p->s[p->pos])) p->pos++;}
+static bool span_eq(const char *s,size_t len,const char *lit) {
+    return strlen(lit)==len && memcmp(s,lit,len)==0;
+}
 static const char *status_name(StageStatus s) {
     const char *names[]={"success","partial_success","retry","fail","skipped"};
     return s>=STAGE_SUCCESS && s<=STAGE_SKIPPED?names[s]:"invalid";
 }
-static const char *resolve(ConditionParser *p,const char *key) {
-    if(str_eq(key,"outcome")) return status_name(p->outcome->status);
-    if(str_eq(key,"preferred_label")) return str_safe(p->outcome->preferred_label);
-    return ctx_get(p->context,str_starts_with(key,"context.")?key+8:key,"");
+static const char *resolve(ConditionParser *p,const char *key,size_t len) {
+    if(span_eq(key,len,"outcome")) return status_name(p->outcome->status);
+    if(span_eq(key,len,"preferred_label")) return str_safe(p->outcome->preferred_label);
+    if(len>=8 && memcmp(key,"context.",8)==0) {key+=8;len-=8;}
+    if(!p->context) return "";
+    for(size_t i=0;i<p->context->count;i++)
+        if(span_eq(key,len,p->context->keys[i])) return p->context->values[i];
+    return "";
 }
 static bool expression(ConditionParser *p);
 static bool primary(ConditionParser *p) {
@@ -28,22 +34,24 @@ static bool primary(ConditionParser *p) {
     }
     size_t start=p->pos;
     while(isalnum((unsigned char)p->s[p->pos]) || (p->s[p->pos] && strchr("_.-",p->s[p->pos]))) p->pos++;
-    if(start==p->pos) {p->valid=false;return false;}
-    char *key=str_ndup(p->s+start,p->pos-start);if(!key) {p->valid=false;return false;}
+    size_t key_len=p->pos-start;
+    if(!key_len) {p->valid=false;return false;}
+    const char *key=p->s+start;
     space(p);bool neq=false;
     if(p->s[p->pos]=='!' && p->s[p->pos+1]=='=') {neq=true;p->pos+=2;}
     else if(p->s[p->pos]=='=') p->pos++;
     else {
-        const char *v=resolve(p,key);bool result=*v && !str_eq(v,"false") && !str_eq(v,"0");free(key);return result;
+        const char *v=resolve(p,key,key_len);
+        return *v && !str_eq(v,"false") && !str_eq(v,"0");
     }
     space(p);start=p->pos;
     while(p->s[p->pos] && !strchr("&|()=<>!",p->s[p->pos])) p->pos++;
-    char *rhs=str_ndup(p->s+start,p->pos-start);if(!rhs) {free(key);p->valid=false;return false;}
-    char *trimmed=str_trim(rhs);if(!*trimmed) p->valid=false;
-    size_t len=strlen(trimmed);
-    if(strchr(trimmed,'"') && (len<2 || trimmed[0]!='"' || trimmed[len-1]!='"' || memchr(trimmed+1,'"',len-2))) p->valid=false;
-    if(len>=2 && trimmed[0]=='"' && trimmed[len-1]=='"') {trimmed[len-1]=0;trimmed++;}
-    bool result=str_eq(resolve(p,key),trimmed);free(rhs);free(key);return neq?!result:result;
+    const char *rhs=p->s+start;size_t len=p->pos-start;
+    while(len && isspace((unsigned char)rhs[len-1])) len--;
+    if(!len) p->valid=false;
+    if(memchr(rhs,'"',len) && (len<2 || rhs[0]!='"' || rhs[len-1]!='"' || memchr(rhs+1,'"',len-2))) p->valid=false;
+    if(len>=2 && rhs[0]=='"' && rhs[len-1]=='"') {rhs++;len-=2;}
+    bool result=span_eq(rhs,len,resolve(p,key,key_len));return neq?!result:result;
 }
 static bool conjunction(ConditionParser *p) {
     bool result=primary(p);

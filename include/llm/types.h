@@ -205,8 +205,8 @@ typedef struct {
     char            *delta;
     char            *reasoning_delta;
     ToolCall        *tool_call;
-    FinishReason    *finish_reason;
-    Usage           *usage;
+    FinishReason     finish_reason;
+    Usage            usage;
     LlmResponse    *response;       /* full response on FINISH */
     char            *error_message;
     char            *raw_json;

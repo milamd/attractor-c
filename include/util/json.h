@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include "util/strindex.h"
 
 /* Minimal JSON types */
 typedef enum {
@@ -19,10 +20,12 @@ typedef struct JsonValue JsonValue;
 struct JsonValue {
     JsonType type;
     bool failed; /* Sticky builder failure; serialize returns NULL. */
-    char *number_text; /* Owned original numeric lexeme, preserves exact parsed integers. */
     union {
         bool        boolean;
-        double      number;
+        struct {
+            double  number;
+            char   *number_text; /* Owned original numeric lexeme, preserves exact parsed integers. */
+        };
         char       *string;
         struct {
             JsonValue **items;
@@ -34,13 +37,14 @@ struct JsonValue {
             JsonValue **values;
             size_t      count;
             size_t      cap;
-            struct StrIndex *index; /* key lookup, built once an object grows */
+            StrIndex    index; /* key lookup, built once an object grows */
         } object;
     };
 };
 
-/* Parse / free */
+/* Parse / free / clone */
 JsonValue  *json_parse(const char *src, const char **err);
+JsonValue  *json_clone(const JsonValue *v);
 void        json_free(JsonValue *v);
 
 /* Accessors */

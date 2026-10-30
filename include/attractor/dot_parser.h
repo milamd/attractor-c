@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include "util/strindex.h"
 
 /*============================================================================
  * Graph Model
@@ -51,6 +52,11 @@ typedef struct {
     bool    loop_restart;
 } DotEdge;
 
+/* Outgoing/incoming CSR adjacency in edge declaration order:
+ * edges of node i are edge[offset[i]..offset[i+1]), and target[k] is the
+ * opposite endpoint's node index or SIZE_MAX when unknown. */
+typedef struct {size_t *offset, *edge, *target;} DotAdjacency;
+
 typedef struct {
     bool     failed; /* transformation allocation/syntax failure */
     char    *name;              /* digraph name */
@@ -69,7 +75,9 @@ typedef struct {
     char   *default_fidelity;
     char   *default_model;
     char   *default_provider;
-    struct StrIndex *node_index; /* id -> node position; owned, NULL for hand-built graphs */
+    StrIndex node_index; /* id -> node position */
+    DotAdjacency out_adj;
+    DotAdjacency in_adj;
 } DotGraph;
 
 /* Parse a DOT source string. Returns NULL on error, sets *err_msg. */
@@ -83,9 +91,6 @@ const char *dot_node_role(const DotNode *node);
 const DotNode *dot_parallel_join(const DotGraph *graph, const DotNode *fork, char **error);
 /* Find nodes/edges */
 DotNode    *dot_find_node(const DotGraph *g, const char *id);
-/* Outgoing adjacency in edge order: edges of node i are edge[offset[i]..offset[i+1]),
- * and target[k] is the node position of edge[k]'s head or SIZE_MAX when unknown. */
-typedef struct {size_t *offset, *edge, *target;} DotAdjacency;
 bool        dot_adjacency_build(const DotGraph *g, DotAdjacency *adjacency);
 void        dot_adjacency_free(DotAdjacency *adjacency);
 /* Return total matching edges, write at most max. NULL/0 counts only; callers
