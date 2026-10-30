@@ -10,9 +10,10 @@
  *==========================================================================*/
 
 typedef enum {
-    AGENT_EVT_SESSION_START,
-    AGENT_EVT_SESSION_END,
+    AGENT_EVT_SESSION_START,        /* before the first input */
+    AGENT_EVT_SESSION_END,          /* on close: abort, unrecoverable error or free */
     AGENT_EVT_USER_INPUT,
+    AGENT_EVT_PROCESSING_END,       /* an input finished processing */
     AGENT_EVT_ASSISTANT_TEXT_START,
     AGENT_EVT_ASSISTANT_TEXT_DELTA,
     AGENT_EVT_ASSISTANT_TEXT_END,
@@ -22,6 +23,7 @@ typedef enum {
     AGENT_EVT_STEERING_INJECTED,
     AGENT_EVT_TURN_LIMIT,
     AGENT_EVT_LOOP_DETECTION,
+    AGENT_EVT_WARNING,
     AGENT_EVT_ERROR
 } AgentEventKind;
 
@@ -55,6 +57,10 @@ struct ExecutionEnv {
     char *(*read_raw)(ExecutionEnv *self, const char *path);
     char *(*read_file)(ExecutionEnv *self, const char *path, int offset, int limit);
     bool  (*write_file)(ExecutionEnv *self, const char *path, const char *content);
+    bool  (*delete_file)(ExecutionEnv *self, const char *path); /* may be NULL */
+    /* Sorted listing, directories suffixed '/', recursing to depth (1 = entries
+     * of path only). Owned text or NULL. May be NULL. */
+    char *(*list_directory)(ExecutionEnv *self, const char *path, int depth);
     bool  (*file_exists)(ExecutionEnv *self, const char *path);
 
     ExecResult *(*exec_command)(ExecutionEnv *self, const char *cmd,
@@ -105,8 +111,21 @@ typedef struct {
     int default_timeout_ms;
     int max_timeout_ms;
 } ToolExecutionContext;
-/* Validates core tool arguments and returns an owned JSON result envelope. */
+/* Validates core tool arguments and returns an owned JSON result envelope
+ * whose output is truncated with the default limits for that tool. */
 char *agent_active_tool(const char *arguments_json, void *userdata, bool *is_error);
+
+/* Per-tool truncation override (spec 5.2/5.3). Zero fields keep the tool
+ * default; max_lines < 0 disables line truncation. Strings are borrowed. */
+typedef struct {
+    const char *tool;
+    int max_chars;
+    int max_lines;
+} ToolOutputLimit;
+/* Character (head_tail or tail) then line truncation with visible markers.
+ * Returns an owned string, or NULL on allocation failure. O(n). */
+char *agent_truncate_output(const char *output, const char *tool_name,
+                            const ToolOutputLimit *overrides, size_t override_count);
 
 /*============================================================================
  * Provider Profile
@@ -120,6 +139,7 @@ typedef struct {
     bool           supports_streaming;
     bool           supports_parallel_tool_calls;
     int            context_window_size;
+    int            default_command_timeout_ms; /* shell default; 0 = SessionConfig */
 
     char *(*build_system_prompt)(const char *env_info, const char *project_docs);
 } ProviderProfile;
@@ -141,14 +161,16 @@ typedef enum {
 } SessionState;
 
 typedef struct {
-    int  max_turns;
-    int  max_tool_rounds_per_input;
+    int  max_turns;                 /* 0 = unlimited */
+    int  max_tool_rounds_per_input; /* per input; 0 = unlimited */
     int  default_command_timeout_ms;
     int  max_command_timeout_ms;
     ReasoningEffort reasoning_effort;
     bool enable_loop_detection;
     int  loop_detection_window;
     int  max_subagent_depth;
+    const ToolOutputLimit *tool_output_limits; /* borrowed, may be NULL */
+    size_t tool_output_limit_count;
 } SessionConfig;
 
 /* Forward declare for subagent support */
@@ -176,12 +198,20 @@ struct AgentSession {
     size_t              followup_count;
 
     bool                abort_signaled;
+    bool                started; /* SESSION_START emitted */
+    char               *project_docs; /* discovered at start (spec 6.5), may be NULL */
     size_t              turn_count;
     bool                failed;
+
+    /* Subagents (spec 7): offered while depth < config.max_subagent_depth. */
+    int                 depth;
+    struct SubAgent   **subagents;
+    size_t              subagent_count;
 };
 
 AgentSession *agent_session_new(ProviderProfile *profile, ExecutionEnv *env,
                                  LlmClient *client, SessionConfig config);
+/* Emits SESSION_END first when the session started and has not closed. */
 void          agent_session_free(AgentSession *s);
 
 /* Submit user input and run the agentic loop */
@@ -210,5 +240,10 @@ SessionConfig agent_default_config(void);
 
 /* Register the core tool set (read_file, write_file, edit_file, shell, grep, glob) */
 void agent_register_core_tools(ToolRegistry *reg);
+/* Registers apply_patch (v4a format, coding-agent spec Appendix A). */
+void agent_register_apply_patch(ToolRegistry *reg);
+/* Applies a v4a patch through env. Every operation is verified before any file
+ * changes. Returns an owned summary or "Error: ..." text (setting *is_error). */
+char *agent_apply_patch(ExecutionEnv *env, const char *patch, bool *is_error);
 
 #endif

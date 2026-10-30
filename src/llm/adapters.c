@@ -1,4 +1,6 @@
+#include <ctype.h>
 #include "llm/client.h"
+#include "stream_sink.h"
 #include "util/str.h"
 #include "util/json.h"
 #include "util/http.h"
@@ -9,15 +11,17 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <uuid/uuid.h>
 
 /*============================================================================
  * Shared adapter helpers
  *==========================================================================*/
 
-static char *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out);
+static char *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out, bool cache);
 static char *build_messages_json_openai(Message **msgs, size_t count, char **instructions_out);
 static char *build_messages_json_gemini(Message **msgs, size_t count, char **system_instruction_out);
-static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count);
+static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bool cache);
+static JsonValue *ephemeral_cache(void);
 static char *build_tools_json_openai(ToolDefinition **tools, size_t count);
 static char *build_tools_json_gemini(ToolDefinition **tools, size_t count);
 
@@ -54,6 +58,38 @@ static void set_error(LlmError *err, LlmErrorCode code, const char *msg,
     err->retryable = retryable;
     err->retry_after = -1.0;
     err->raw_json = NULL;
+}
+
+/* Spec 6.5: statuses that do not identify the failure (400, 422 and
+ * unmapped codes) are refined by the provider's message text. */
+LlmErrorCode llm_error_classify(int status, const char *message) {
+    LlmErrorCode code = llm_error_from_status(status);
+    if ((code != LLM_ERR_INVALID_REQUEST && code != LLM_ERR_PROVIDER) || !message) return code;
+    if (str_icontains(message, "not found") || str_icontains(message, "does not exist")) return LLM_ERR_NOT_FOUND;
+    if (str_icontains(message, "unauthorized") || str_icontains(message, "invalid key")) return LLM_ERR_AUTH;
+    if (str_icontains(message, "context length") || str_icontains(message, "too many tokens")) return LLM_ERR_CONTEXT_LENGTH;
+    if (str_icontains(message, "content filter") || str_icontains(message, "safety")) return LLM_ERR_CONTENT_FILTER;
+    return code;
+}
+
+/* Non-2xx response: classified error with the provider's message, unless it
+ * echoes the credential, and any Retry-After hint. */
+static void status_error(LlmError *err, const HttpResponse *resp, const char *provider, const char *secret) {
+    JsonValue *body = resp->body ? json_parse(resp->body, NULL) : NULL;
+    const char *detail = json_get_string(json_get(body, "error"), "message");
+    if (detail && (strnlen(detail, 1025) > 1024 || (secret && strstr(detail, secret)))) detail = NULL;
+    bool retryable = resp->status_code == 429 || resp->status_code >= 500;
+    StrBuf message; strbuf_init(&message);
+    strbuf_append_cstr(&message, "Provider rejected request");
+    if (detail) strbuf_appendf(&message, ": %s", detail);
+    char *text = strbuf_detach(&message);
+    set_error(err, llm_error_classify(resp->status_code, detail), text ? text : "Provider rejected request", provider, resp->status_code, retryable);
+    free(text);
+    json_free(body);
+    if (err) {
+        char hint[64]; const char *value = http_header_get(resp->headers_raw, "Retry-After", hint, sizeof(hint));
+        if (value) { char *end; double seconds = strtod(value, &end); if (!*end && isfinite(seconds) && seconds >= 0) err->retry_after = seconds; }
+    }
 }
 
 static char *quoted(const char *text) {
@@ -95,7 +131,49 @@ typedef struct {
     char *base_url;
 } AnthropicState;
 
-static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+/* Shared transport: blocking request, or SSE when streaming. */
+static HttpResponse *send_request(const HttpRequest *hreq, StreamSink *sink) {
+    return sink ? stream_sink_transport(sink, hreq) : http_request(hreq);
+}
+/* Maps a missing response to cancel, caller stop, stream failure, or network error. */
+static void transport_error(LlmError *err, const LlmRequest *req, StreamSink *sink, const char *provider) {
+    if (req->cancel && *req->cancel) set_error(err, LLM_ERR_ABORT, "Cancelled", provider, 0, false);
+    else if (sink && stream_sink_stopped(sink)) set_error(err, LLM_ERR_ABORT, "Stream stopped by caller", provider, 0, false);
+    else if (sink && stream_sink_error(sink)) set_error(err, LLM_ERR_STREAM, stream_sink_error(sink), provider, 0, false);
+    else set_error(err, LLM_ERR_NETWORK, "HTTP request failed", provider, 0, true);
+}
+typedef LlmResponse *(*RequestFn)(ProviderAdapter *, const LlmRequest *, LlmError *, StreamSink *);
+static LlmResponse *run_stream(ProviderAdapter *self, const LlmRequest *req, StreamCallback cb, void *userdata,
+                               LlmError *err, SinkKind kind, RequestFn request) {
+    StreamSink *sink = stream_sink_new(kind, cb, userdata);
+    if (!sink) { set_error(err, LLM_ERR_CONFIG, "Allocation failed", self->name, 0, false); return NULL; }
+    LlmResponse *r = request(self, req, err, sink);
+    if (r) stream_sink_finish(sink, r);
+    else stream_sink_fail(sink, err && err->message ? err->message : "Stream failed");
+    stream_sink_free(sink);
+    return r;
+}
+
+#define ANTHROPIC_EXTRACTOR "structured_output"
+
+/* Replaces the forced extraction tool call with its arguments as plain text. */
+static bool extracted_to_text(LlmResponse *r) {
+    for (size_t i = 0; i < r->tool_call_count; i++) {
+        if (!str_eq(r->tool_calls[i]->name, ANTHROPIC_EXTRACTOR)) continue;
+        char *text = str_dup(r->tool_calls[i]->arguments_json);
+        Message *message = text ? message_assistant(text) : NULL;
+        if (!message) { free(text); return false; }
+        for (size_t k = 0; k < r->tool_call_count; k++) tool_call_free(r->tool_calls[k]);
+        free(r->tool_calls); r->tool_calls = NULL; r->tool_call_count = 0;
+        message_free(r->message); r->message = message;
+        free(r->text); r->text = text;
+        r->finish_reason.reason = FINISH_STOP;
+        return true;
+    }
+    return false;
+}
+
+static LlmResponse *anthropic_request(ProviderAdapter *self, const LlmRequest *req, LlmError *err, StreamSink *sink) {
     unsigned long request_failures=mem_failure_count();
     AnthropicState *st = self->impl;
     if(req->reasoning_effort!=REASONING_NONE) {set_error(err,LLM_ERR_CONFIG,"Reasoning effort control is unsupported for Anthropic","anthropic",0,false);return NULL;}
@@ -105,12 +183,51 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
     }
 
 
+    /* provider_options.anthropic: auto_cache (default true) and beta_headers.
+     * Caching heuristic: breakpoints on the system prompt, the last tool
+     * definition, and the newest message block (3 of Anthropic's 4). */
+    JsonValue *options = req->provider_options_json ? json_parse(req->provider_options_json, NULL) : NULL;
+    JsonValue *anthropic_options = json_get(options, "anthropic");
+    bool cache = json_get_bool(anthropic_options, "auto_cache", true);
+    StrBuf beta; strbuf_init(&beta);
+    JsonValue *betas = json_get(anthropic_options, "beta_headers");
+    for (size_t i = 0; betas && betas->type == JSON_ARRAY && i < betas->array.count; i++) {
+        const JsonValue *b = betas->array.items[i];
+        bool safe = b->type == JSON_STRING && *b->string && strlen(b->string) <= 128;
+        for (const char *c = safe ? b->string : ""; *c && safe; c++) safe = isalnum((unsigned char)*c) || *c == '-' || *c == '_' || *c == '.';
+        if (!safe) { json_free(options); strbuf_free(&beta); set_error(err,LLM_ERR_CONFIG,"Invalid anthropic beta header","anthropic",0,false); return NULL; }
+        strbuf_appendf(&beta, "%s%s", beta.len ? "," : "anthropic-beta: ", b->string);
+    }
+    json_free(options);
+    if (cache) strbuf_appendf(&beta, "%sprompt-caching-2024-07-31", beta.len ? "," : "anthropic-beta: ");
+
     /* Build request body */
     char *system_prompt = NULL;
-    char *messages_json = build_messages_json_anthropic(req->messages, req->message_count, &system_prompt);
-    char *tools_json = req->tool_count > 0 && !(req->tool_choice && req->tool_choice->mode==TOOL_CHOICE_NONE)
-        ? build_tools_json_anthropic(req->tools, req->tool_count)
+    char *messages_json = build_messages_json_anthropic(req->messages, req->message_count, &system_prompt, cache);
+    /* Structured output has no native mode: json_schema forces a call to an
+     * extraction tool whose input schema is the requested schema. */
+    const ResponseFormat *rf = req->response_format;
+    bool extract = rf && str_eq(rf->type, "json_schema");
+    ToolDefinition extractor = {.name = ANTHROPIC_EXTRACTOR, .description = "Return the final answer as structured output.", .parameters_json = extract ? rf->json_schema : NULL};
+    ToolDefinition **tool_list = req->tools; size_t tool_total = req->tool_count;
+    ToolDefinition **with_extractor = NULL;
+    if (extract) {
+        with_extractor = mem_calloc(req->tool_count + 1, sizeof(*with_extractor));
+        if (!with_extractor) { free(messages_json); free(system_prompt); strbuf_free(&beta); set_error(err,LLM_ERR_CONFIG,"Allocation failed","anthropic",0,false); return NULL; }
+        for (size_t i = 0; i < req->tool_count; i++) with_extractor[i] = req->tools[i];
+        with_extractor[req->tool_count] = &extractor;
+        tool_list = with_extractor; tool_total = req->tool_count + 1;
+    }
+    char *tools_json = tool_total > 0 && (extract || !(req->tool_choice && req->tool_choice->mode==TOOL_CHOICE_NONE))
+        ? build_tools_json_anthropic(tool_list, tool_total, cache)
         : NULL;
+    free(with_extractor);
+    if (rf && str_eq(rf->type, "json")) {
+        StrBuf sys; strbuf_init(&sys);
+        if (system_prompt) { strbuf_append_cstr(&sys, system_prompt); strbuf_append_cstr(&sys, "\n\n"); }
+        strbuf_append_cstr(&sys, "Respond with only a single valid JSON object and no other text.");
+        free(system_prompt); system_prompt = strbuf_detach(&sys);
+    }
 
     StrBuf body;
     strbuf_init(&body);
@@ -122,6 +239,14 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
     if (system_prompt) {
         /* Escape system prompt for JSON */
         JsonValue *sp = json_new_string(system_prompt);
+        if (cache) {
+            JsonValue *block = json_new_object();
+            json_object_set(block, "type", json_new_string("text"));
+            json_object_set(block, "text", sp);
+            json_object_set(block, "cache_control", ephemeral_cache());
+            sp = json_new_array();
+            json_array_push(sp, block);
+        }
         char *sp_json = json_serialize(sp);
         strbuf_appendf(&body, ",\"system\":%s", sp_json);
         free(sp_json);
@@ -134,7 +259,8 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
 
     if (tools_json) {
         strbuf_appendf(&body, ",\"tools\":%s", tools_json);
-        if (req->tool_choice) {
+        if (extract) strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"tool\",\"name\":\"" ANTHROPIC_EXTRACTOR "\"}");
+        else if (req->tool_choice) {
             switch (req->tool_choice->mode) {
                 case TOOL_CHOICE_AUTO:     strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"auto\"}"); break;
                 case TOOL_CHOICE_REQUIRED: strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"any\"}"); break;
@@ -152,6 +278,7 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
 
     if (req->temperature >= 0) append_number(&body,",\"temperature\":",req->temperature);
     if (req->top_p >= 0) append_number(&body,",\"top_p\":",req->top_p);
+    if (sink) strbuf_append_cstr(&body, ",\"stream\":true");
 
     strbuf_append_cstr(&body, "}");
 
@@ -167,8 +294,10 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
         auth_hdr,
         ver_hdr,
         "content-type: application/json",
+        beta.len ? beta.data : NULL,
         NULL
     };
+    if (beta.failed) body.failed = true;
 
     HttpRequest hreq = {
         .url = url.data,
@@ -180,30 +309,32 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
     };
 
     JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
-    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
     mem_wipe(auth_hdr,sizeof(auth_hdr));
     json_free(validated);
     strbuf_free(&url);
+    strbuf_free(&beta);
     char *body_str = strbuf_detach(&body);
     free(body_str);
 
     if (!resp) {
-        set_error(err, LLM_ERR_NETWORK, "HTTP request failed", "anthropic", 0, true);
+        transport_error(err, req, sink, "anthropic");
         return NULL;
     }
 
     if (resp->status_code < 200 || resp->status_code >= 300) {
-        bool retryable = (resp->status_code == 429 || resp->status_code >= 500);
-        set_error(err, llm_error_from_status(resp->status_code),
-                  "Provider rejected request",
-                  "anthropic", resp->status_code, retryable);
-        if(err) {char hint[64];const char *value=http_header_get(resp->headers_raw,"Retry-After",hint,sizeof(hint));
-            if(value) {char *end;double seconds=strtod(value,&end);if(!*end && isfinite(seconds) && seconds>=0) err->retry_after=seconds;}}
+        status_error(err, resp, "anthropic", st->api_key);
         http_response_free(resp);
         return NULL;
     }
 
     LlmResponse *result = parse_anthropic_response(resp->body);
+    if (result && extract && !extracted_to_text(result)) {
+        llm_response_free(result); result = NULL;
+        set_error(err, LLM_ERR_NO_OBJECT, "Model did not return structured output", "anthropic", 200, false);
+        http_response_free(resp);
+        return NULL;
+    }
     if (result) {
         result->provider = str_dup("anthropic");
         result->raw_json = str_dup(resp->body);
@@ -216,11 +347,13 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
     return result;
 }
 
-static int anthropic_stream(ProviderAdapter *self, const LlmRequest *req,
-                            StreamCallback cb, void *userdata, LlmError *err) {
-    (void)self; (void)req; (void)cb; (void)userdata;
-    set_error(err, LLM_ERR_CONFIG, "Streaming not yet implemented for Anthropic", "anthropic", 0, false);
-    return -1;
+static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+    return anthropic_request(self, req, err, NULL);
+}
+
+static LlmResponse *anthropic_stream(ProviderAdapter *self, const LlmRequest *req,
+                                StreamCallback cb, void *userdata, LlmError *err) {
+    return run_stream(self, req, cb, userdata, err, SINK_ANTHROPIC, anthropic_request);
 }
 
 static void anthropic_close(ProviderAdapter *self) {
@@ -254,7 +387,7 @@ typedef struct {
     char *base_url;
 } OpenAIState;
 
-static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+static LlmResponse *openai_request(ProviderAdapter *self, const LlmRequest *req, LlmError *err, StreamSink *sink) {
     unsigned long request_failures=mem_failure_count();
     OpenAIState *st = self->impl;
     for(size_t i=0;i<req->message_count;i++) for(size_t k=0;k<req->messages[i]->part_count;k++) {
@@ -313,6 +446,15 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
             strbuf_appendf(&body, ",\"reasoning\":{\"effort\":\"%s\"}", effort);
     }
 
+    /* Structured output: Responses API text.format (schema validated by the client). */
+    const ResponseFormat *rf = req->response_format;
+    if (rf && str_eq(rf->type, "json_schema"))
+        strbuf_appendf(&body, ",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"output\",\"schema\":%s,\"strict\":%s}}",
+                       rf->json_schema, rf->strict ? "true" : "false");
+    else if (rf && str_eq(rf->type, "json"))
+        strbuf_append_cstr(&body, ",\"text\":{\"format\":{\"type\":\"json_object\"}}");
+    if (sink) strbuf_append_cstr(&body, ",\"stream\":true");
+
     strbuf_append_cstr(&body, "}");
 
     StrBuf url;
@@ -330,7 +472,7 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
     };
 
     JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
-    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
     mem_wipe(auth_hdr,sizeof(auth_hdr));
     json_free(validated);
     strbuf_free(&url);
@@ -338,17 +480,12 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
     free(body_cpy);
 
     if (!resp) {
-        set_error(err, LLM_ERR_NETWORK, "HTTP request failed", "openai", 0, true);
+        transport_error(err, req, sink, "openai");
         return NULL;
     }
 
     if (resp->status_code < 200 || resp->status_code >= 300) {
-        bool retryable = (resp->status_code == 429 || resp->status_code >= 500);
-        set_error(err, llm_error_from_status(resp->status_code),
-                  "Provider rejected request",
-                  "openai", resp->status_code, retryable);
-        if(err) {char hint[64];const char *value=http_header_get(resp->headers_raw,"Retry-After",hint,sizeof(hint));
-            if(value) {char *end;double seconds=strtod(value,&end);if(!*end && isfinite(seconds) && seconds>=0) err->retry_after=seconds;}}
+        status_error(err, resp, "openai", st->api_key);
         http_response_free(resp);
         return NULL;
     }
@@ -366,11 +503,13 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
     return result;
 }
 
-static int openai_stream(ProviderAdapter *self, const LlmRequest *req,
-                         StreamCallback cb, void *userdata, LlmError *err) {
-    (void)self; (void)req; (void)cb; (void)userdata;
-    set_error(err, LLM_ERR_CONFIG, "Streaming not yet implemented for OpenAI", "openai", 0, false);
-    return -1;
+static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+    return openai_request(self, req, err, NULL);
+}
+
+static LlmResponse *openai_stream(ProviderAdapter *self, const LlmRequest *req,
+                                StreamCallback cb, void *userdata, LlmError *err) {
+    return run_stream(self, req, cb, userdata, err, SINK_OPENAI, openai_request);
 }
 
 static void openai_close(ProviderAdapter *self) {
@@ -404,7 +543,7 @@ typedef struct {
     char *base_url;
 } GeminiState;
 
-static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+static LlmResponse *gemini_request(ProviderAdapter *self, const LlmRequest *req, LlmError *err, StreamSink *sink) {
     unsigned long request_failures=mem_failure_count();
     GeminiState *st = self->impl;
     if(req->reasoning_effort!=REASONING_NONE || (req->tool_choice && req->tool_choice->mode!=TOOL_CHOICE_AUTO)) {set_error(err,LLM_ERR_CONFIG,"Reasoning effort and named tool-choice control are unsupported for Gemini","gemini",0,false);return NULL;}
@@ -447,6 +586,12 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     if (req->max_tokens > 0) { strbuf_appendf(&gc, "\"maxOutputTokens\":%d", req->max_tokens); has_gc = true; }
     if (req->temperature >= 0) { if (has_gc) strbuf_append_cstr(&gc, ","); append_number(&gc,"\"temperature\":",req->temperature); has_gc = true; }
     if(req->top_p>=0) {if(has_gc) strbuf_append_cstr(&gc,",");append_number(&gc,"\"topP\":",req->top_p);has_gc=true;}
+    const ResponseFormat *rf = req->response_format;
+    if (rf && (str_eq(rf->type, "json") || str_eq(rf->type, "json_schema"))) {
+        strbuf_appendf(&gc, "%s\"responseMimeType\":\"application/json\"", has_gc ? "," : "");
+        if (str_eq(rf->type, "json_schema")) strbuf_appendf(&gc, ",\"responseSchema\":%s", rf->json_schema);
+        has_gc = true;
+    }
     strbuf_append_cstr(&gc, "}");
     if (has_gc) strbuf_append_cstr(&body, gc.data);
     strbuf_free(&gc);
@@ -457,7 +602,7 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     strbuf_init(&url);
     char *model_path=url_component(req->model);
     if(!model_path) url.failed=true;
-    else strbuf_appendf(&url,"%s/v1beta/models/%s:generateContent",st->base_url?st->base_url:"https://generativelanguage.googleapis.com",model_path);
+    else strbuf_appendf(&url,"%s/v1beta/models/%s:%s",st->base_url?st->base_url:"https://generativelanguage.googleapis.com",model_path,sink?"streamGenerateContent?alt=sse":"generateContent");
     free(model_path);
 
     char auth_hdr[512];snprintf(auth_hdr,sizeof(auth_hdr),"x-goog-api-key: %s",st->api_key);
@@ -469,7 +614,7 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     };
 
     JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
-    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
     mem_wipe(auth_hdr,sizeof(auth_hdr));
     json_free(validated);
     strbuf_free(&url);
@@ -477,17 +622,12 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     free(body_cpy);
 
     if (!resp) {
-        set_error(err, LLM_ERR_NETWORK, "HTTP request failed", "gemini", 0, true);
+        transport_error(err, req, sink, "gemini");
         return NULL;
     }
 
     if (resp->status_code < 200 || resp->status_code >= 300) {
-        bool retryable = (resp->status_code == 429 || resp->status_code >= 500);
-        set_error(err, llm_error_from_status(resp->status_code),
-                  "Provider rejected request",
-                  "gemini", resp->status_code, retryable);
-        if(err) {char hint[64];const char *value=http_header_get(resp->headers_raw,"Retry-After",hint,sizeof(hint));
-            if(value) {char *end;double seconds=strtod(value,&end);if(!*end && isfinite(seconds) && seconds>=0) err->retry_after=seconds;}}
+        status_error(err, resp, "gemini", st->api_key);
         http_response_free(resp);
         return NULL;
     }
@@ -505,11 +645,13 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
     return result;
 }
 
-static int gemini_stream(ProviderAdapter *self, const LlmRequest *req,
-                         StreamCallback cb, void *userdata, LlmError *err) {
-    (void)self; (void)req; (void)cb; (void)userdata;
-    set_error(err, LLM_ERR_CONFIG, "Streaming not yet implemented for Gemini", "gemini", 0, false);
-    return -1;
+static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req, LlmError *err) {
+    return gemini_request(self, req, err, NULL);
+}
+
+static LlmResponse *gemini_stream(ProviderAdapter *self, const LlmRequest *req,
+                                StreamCallback cb, void *userdata, LlmError *err) {
+    return run_stream(self, req, cb, userdata, err, SINK_GEMINI, gemini_request);
 }
 
 static void gemini_close(ProviderAdapter *self) {
@@ -539,10 +681,12 @@ ProviderAdapter *gemini_adapter_new(const char *api_key, const char *base_url) {
  *==========================================================================*/
 
 /* Build Anthropic messages JSON, extracting system messages */
-static char *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out) {
+static char *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out, bool cache) {
     StrBuf sys;
     strbuf_init(&sys);
     JsonValue *arr = json_new_array();
+    JsonValue *prev_content = NULL;
+    const char *prev_role = NULL;
 
     for (size_t i = 0; i < count; i++) {
         Message *m = msgs[i];
@@ -559,10 +703,12 @@ static char *build_messages_json_anthropic(Message **msgs, size_t count, char **
         /* TOOL role -> user role with tool_result blocks */
         if (m->role == ROLE_TOOL) role_str = "user";
 
-        JsonValue *msg = json_new_object();
-        json_object_set(msg, "role", json_new_string(role_str));
-
-        JsonValue *content = json_new_array();
+        /* Anthropic requires alternation: consecutive same-role messages
+         * (e.g. parallel tool results) merge into one. */
+        bool merge = prev_content && str_eq(prev_role, role_str);
+        JsonValue *msg = merge ? NULL : json_new_object();
+        JsonValue *content = merge ? prev_content : json_new_array();
+        if (msg) json_object_set(msg, "role", json_new_string(role_str));
         for (size_t j = 0; j < m->part_count; j++) {
             ContentPart *p = m->parts[j];
             JsonValue *block = json_new_object();
@@ -602,8 +748,24 @@ static char *build_messages_json_anthropic(Message **msgs, size_t count, char **
             }
             json_array_push(content, block);
         }
-        json_object_set(msg, "content", content);
-        json_array_push(arr, msg);
+        if (msg) {
+            json_object_set(msg, "content", content);
+            json_array_push(arr, msg);
+            prev_content = content;
+            prev_role = role_str;
+        }
+    }
+
+    /* Breakpoint on the newest cacheable block: the next turn reuses the whole
+     * conversation prefix up to here (thinking blocks cannot carry one). */
+    if (cache && prev_content) {
+        for (size_t i = prev_content->array.count; i > 0; i--) {
+            JsonValue *block = prev_content->array.items[i - 1];
+            const char *type = json_get_string(block, "type");
+            if (str_eq(type, "thinking") || str_eq(type, "redacted_thinking")) continue;
+            json_object_set(block, "cache_control", ephemeral_cache());
+            break;
+        }
     }
 
     *system_out = sys.len > 0 ? strbuf_detach(&sys) : NULL;
@@ -677,6 +839,8 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
     StrBuf sys;
     strbuf_init(&sys);
     JsonValue *arr = json_new_array();
+    JsonValue *prev_parts = NULL;
+    const char *prev_role = NULL;
 
     for (size_t i = 0; i < count; i++) {
         Message *m = msgs[i];
@@ -691,9 +855,11 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
         const char *role = "user";
         if (m->role == ROLE_ASSISTANT) role = "model";
 
-        JsonValue *content = json_new_object();
-        json_object_set(content, "role", json_new_string(role));
-        JsonValue *parts = json_new_array();
+        /* Group consecutive same-role turns (parallel functionResponses). */
+        bool merge = prev_parts && str_eq(prev_role, role);
+        JsonValue *content = merge ? NULL : json_new_object();
+        JsonValue *parts = merge ? prev_parts : json_new_array();
+        if (content) json_object_set(content, "role", json_new_string(role));
 
         for (size_t j = 0; j < m->part_count; j++) {
             ContentPart *p = m->parts[j];
@@ -725,8 +891,12 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
                 json_array_push(parts, part);
             }
         }
-        json_object_set(content, "parts", parts);
-        json_array_push(arr, content);
+        if (content) {
+            json_object_set(content, "parts", parts);
+            json_array_push(arr, content);
+            prev_parts = parts;
+            prev_role = role;
+        }
     }
 
     *system_instruction_out = sys.len > 0 ? strbuf_detach(&sys) : NULL;
@@ -737,7 +907,13 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
 }
 
 /* Build Anthropic tools JSON */
-static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count) {
+static JsonValue *ephemeral_cache(void) {
+    JsonValue *c = json_new_object();
+    json_object_set(c, "type", json_new_string("ephemeral"));
+    return c;
+}
+
+static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bool cache) {
     JsonValue *arr = json_new_array();
     for (size_t i = 0; i < count; i++) {
         JsonValue *t = json_new_object();
@@ -748,6 +924,8 @@ static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count) {
             JsonValue *schema = json_parse(tools[i]->parameters_json, &e);
             json_object_set(t, "input_schema", schema);
         }
+        /* A breakpoint on the last tool caches the whole tool list. */
+        if (cache && i + 1 == count) json_object_set(t, "cache_control", ephemeral_cache());
         json_array_push(arr, t);
     }
     char *result = json_serialize(arr);
@@ -885,7 +1063,9 @@ static LlmResponse *parse_response(const char *provider,const char *source) {
                 }
             } else if(text) part=text_part(text);
             else if(call) {
-                char id[64];snprintf(id,sizeof(id),"call_%zu",i);char *args=json_serialize(json_get(call,"args"));
+                /* Gemini assigns no IDs; synthesize unique ones (spec 7.3). */
+                uuid_t uuid;uuid_generate_random(uuid);char id[48],text_id[37];uuid_unparse_lower(uuid,text_id);snprintf(id,sizeof(id),"call_%s",text_id);
+                char *args=json_serialize(json_get(call,"args"));
                 part=tool_part(id,json_get_string(call,"name"),args);free(args);
             }
             if(part) part->provider_metadata_json=json_serialize(item);

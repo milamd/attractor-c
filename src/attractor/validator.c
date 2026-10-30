@@ -129,12 +129,14 @@ static void rule_start_node(const DotGraph *g, DiagnosticList *dl) {
  *==========================================================================*/
 
 static void rule_terminal_node(const DotGraph *g, DiagnosticList *dl) {
-    for (size_t i = 0; i < g->node_count; i++) {
-        if (is_terminal_node(&g->nodes[i])) return;
-    }
+    size_t count = 0;
+    for (size_t i = 0; i < g->node_count; i++)
+        if (is_terminal_node(&g->nodes[i])) count++;
+    if (count == 1) return;
     diagnostic_list_add(dl, DIAG_ERROR, "terminal_node",
-        "No terminal node found. Add a node with shape=Msquare or id=\"exit\"/\"end\".",
-        NULL, "Add a node: exit [shape=Msquare]");
+        count ? "Pipeline must have exactly one terminal node (shape=Msquare or id=\"exit\"/\"end\")."
+              : "No terminal node found. Add a node with shape=Msquare or id=\"exit\"/\"end\".",
+        NULL, count ? "Route every finishing path to a single exit node." : "Add a node: exit [shape=Msquare]");
 }
 
 /*============================================================================
@@ -176,7 +178,8 @@ static void rule_reachability(const DotGraph *g, DiagnosticList *dl) {
             strbuf_init(&msg);
             strbuf_appendf(&msg, "Node \"%s\" is not reachable from the start node.",
                            g->nodes[i].id);
-            diagnostic_list_add(dl, DIAG_ERROR, "reachability", msg.data,
+            /* Unreachable nodes never run; warn (spec 11.12 parity matrix). */
+            diagnostic_list_add(dl, DIAG_WARNING, "reachability", msg.data,
                                 g->nodes[i].id, "Add an edge from a reachable node to this node.");
             strbuf_free(&msg);
         }
@@ -308,7 +311,7 @@ static void rule_type_known(const DotGraph *g, DiagnosticList *dl, HandlerTypeKn
             strbuf_init(&msg);
             strbuf_appendf(&msg, "Node \"%s\" has unknown type \"%s\".",
                            n->id, n->type);
-            diagnostic_list_add(dl, DIAG_ERROR, "type_known", msg.data,
+            diagnostic_list_add(dl, DIAG_WARNING, "type_known", msg.data,
                                 n->id,
                                 "Use one of: start, exit, codergen, wait.human, "
                                 "conditional, parallel, parallel.fan_in, tool, "
@@ -529,7 +532,7 @@ DiagnosticList validate_graph_with_handlers(const DotGraph *g,HandlerTypeKnown k
             if(!str_eq(join,"wait_all") && !str_eq(join,"first_success") && !str_eq(join,"quorum")) diagnostic_list_add(&dl,DIAG_ERROR,"parallel_policy","Unsupported join policy",id,NULL);
             if(!str_eq(policy,"continue") && !str_eq(policy,"fail_fast")) diagnostic_list_add(&dl,DIAG_ERROR,"parallel_policy","Unsupported error policy",id,NULL);
         }
-        if(str_eq(dot_node_role(&g->nodes[i]),"unsupported")) diagnostic_list_add(&dl,DIAG_ERROR,"type_known","Unsupported shape without explicit handler type",id,NULL);
+        if(str_eq(dot_node_role(&g->nodes[i]),"unsupported")) diagnostic_list_add(&dl,DIAG_WARNING,"type_known","Unsupported shape; the codergen handler runs it",id,NULL);
     }
     /* ERROR rules */
     rule_start_node(g, &dl);

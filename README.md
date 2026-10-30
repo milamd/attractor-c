@@ -55,7 +55,11 @@ A completed checkpoint returns its saved result. The program rejects old checkpo
 
 ## Limits and other checks
 
-Branches and tools run in sequence. Sessions use one thread. The LLM client uses text and tool calls. It cannot use streaming, image input, audio input, or document input.
+Branches and tools run in sequence. Sessions use one thread, so a subagent runs when its parent calls `wait`. The LLM client supports text, tool calls, streaming, structured output (`llm_generate_object`), and Anthropic prompt caching. It cannot use image input, audio input, or document input.
+
+An LLM stage reports its outcome by writing `status.json` in its stage directory (Attractor spec Appendix C). The prompt gives the agent the path. A stage without that file succeeds. The agent's file tools can write the file only when the logs directory is inside the working directory. The default logs directory meets this condition.
+
+Agent sessions add project instructions to the system prompt: `AGENTS.md` and the provider's own file (`CLAUDE.md`, `GEMINI.md` or `.codex/instructions.md`) from the git root down to the working directory, up to 32KB. An edge with `loop_restart=true` ends the run and starts a new one at its target, logging to `<logs-dir>/restart-<n>`.
 
 ```sh
 make sanitize  # Do tests with ASan and UBSan.

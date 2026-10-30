@@ -31,11 +31,15 @@ typedef struct {
 /* Execute HTTP request. Caller must free response. */
 HttpResponse *http_request(const HttpRequest *req);
 
-/* SSE callback: receives event type and data for each SSE event */
-typedef void (*SseCallback)(const char *event_type, const char *data, void *userdata);
+/* SSE callback: receives the event type ("message" when unnamed) and data for
+ * each event. Return false to stop the stream. */
+typedef bool (*SseCallback)(const char *event_type, const char *data, void *userdata);
 
-/* SSE is currently unsupported: returns -1. */
-int http_stream_sse(const HttpRequest *req, SseCallback cb, void *userdata);
+/* Streams a request as Server-Sent Events, parsing incrementally. For a 2xx
+ * response each event is delivered as it arrives; otherwise the body is
+ * returned in *error_response (owned) for error mapping. Returns the HTTP
+ * status, or -1 on transport failure or cancellation. */
+int http_stream_sse(const HttpRequest *req, SseCallback cb, void *userdata, HttpResponse **error_response);
 
 /* Get a header value from raw headers (case-insensitive). Returns NULL if not found. */
 const char *http_header_get(const char *headers_raw, const char *name, char *buf, size_t buf_sz);

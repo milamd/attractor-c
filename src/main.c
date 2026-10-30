@@ -1,6 +1,7 @@
 #include "attractor/dot_parser.h"
 #include "attractor/validator.h"
 #include "attractor/engine.h"
+#include "attractor/agent_backend.h"
 #include "llm/client.h"
 #include "agent/agent.h"
 #include "util/str.h"
@@ -77,71 +78,6 @@ static void verbose_event_cb(const PipelineEvent *ev, void *userdata) {
     if (ev->data)
         fprintf(stderr, " %s", ev->data);
     fprintf(stderr, "\n");
-}
-
-/*============================================================================
- * Codergen backend using agent session
- *==========================================================================*/
-
-typedef struct {
-    LlmClient    *llm;
-    const char   *model;
-    const char   *provider;
-    ExecutionEnv *exec_env;
-} AgentBackendState;
-
-static ReasoningEffort parse_reasoning_effort(const char *s) {
-    if (!s || !*s) return REASONING_HIGH;
-    if (str_eq(s, "low"))    return REASONING_LOW;
-    if (str_eq(s, "medium")) return REASONING_MEDIUM;
-    if (str_eq(s, "high"))   return REASONING_HIGH;
-    if (str_eq(s, "none"))   return REASONING_NONE;
-    return REASONING_HIGH;
-}
-
-static char *agent_backend_run(CodergenBackend *self, const DotNode *node,
-                                const char *prompt, const PipelineContext *ctx) {
-    AgentBackendState *st = self->impl;
-    (void)ctx;
-
-    /* Use node's model/provider if set, else fall back to runner defaults */
-    const char *model    = (node && node->llm_model)    ? node->llm_model    : st->model;
-    const char *provider = (node && node->llm_provider)  ? node->llm_provider  : st->provider;
-    ReasoningEffort effort = (node && node->reasoning_effort)
-        ? parse_reasoning_effort(node->reasoning_effort) : (str_eq(provider,"openai")?REASONING_HIGH:REASONING_NONE);
-
-    ToolRegistry registry;tool_registry_init(&registry);agent_register_core_tools(&registry);
-    ActiveTool tools[6]={0};ToolExecutionContext contexts[6]={0};
-    if(registry.failed || registry.count>6) {tool_registry_free(&registry);return NULL;}
-    for(size_t i=0;i<registry.count;i++) {
-        contexts[i]=(ToolExecutionContext){.tool=registry.tools[i],.env=st->exec_env,.default_timeout_ms=10000,.max_timeout_ms=600000};
-        tools[i]=(ActiveTool){.def=registry.tools[i]->def,.execute=agent_active_tool,.userdata=&contexts[i]};
-    }
-
-    LlmError err = {0};
-    GenerateResult *result = llm_generate(
-        st->llm, model, prompt,
-        NULL, 0,      /* messages */
-        NULL,          /* system_prompt */
-        tools, registry.count,
-        50,            /* max_tool_rounds */
-        effort,
-        provider,
-        2,             /* max_retries */
-        &err
-    );
-
-    tool_registry_free(&registry);
-
-    if (!result) {
-        fprintf(stderr, "LLM error: %s\n", err.message ? err.message : "unknown");
-        llm_error_free(&err);
-        return NULL;
-    }
-
-    char *text = result->text ? str_dup(result->text) : str_dup("");
-    generate_result_free(result);
-    return text;
 }
 
 /*============================================================================
@@ -288,7 +224,6 @@ int main(int argc, char **argv) {
     /* Set up codergen backend */
     LlmClient *llm = NULL;
     CodergenBackend *backend = NULL;
-    AgentBackendState *backend_state = NULL;
     ExecutionEnv *exec_env = local_exec_env_new(NULL);
     if(!exec_env) {pipeline_runner_free(runner);dot_graph_free(graph);http_global_cleanup();return 1;}
     pipeline_runner_set_execution_env(runner,exec_env);
@@ -300,21 +235,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Warning: no LLM providers configured. Running in dry-run mode.\n");
             fprintf(stderr, "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.\n");
         } else {
-            backend = mem_calloc(1, sizeof(CodergenBackend));
-            backend_state = mem_calloc(1, sizeof(AgentBackendState));
-            if(!backend || !backend_state) {free(backend);free(backend_state);pipeline_runner_free(runner);dot_graph_free(graph);exec_env_free(exec_env);llm_client_free(llm);http_global_cleanup();return 1;}
-            backend_state->llm = llm;
-            backend_state->exec_env = exec_env;
             /* Model/provider resolution: CLI override > graph default > auto-detect */
-            backend_state->model = model_override ? model_override :
+            const char *model = model_override ? model_override :
                         (graph->default_model ? graph->default_model :
                         ((llm->default_provider && strcmp(llm->default_provider, "anthropic") == 0)
                             ? "claude-sonnet-4-5" : "gpt-5.2-mini"));
-            backend_state->provider = provider_override ? provider_override :
+            const char *provider = provider_override ? provider_override :
                            (graph->default_provider ? graph->default_provider :
                             llm->default_provider);
-            backend->impl = backend_state;
-            backend->run = agent_backend_run;
+            backend = agent_codergen_backend_new(llm, exec_env, model, provider);
+            if(!backend) {pipeline_runner_free(runner);dot_graph_free(graph);exec_env_free(exec_env);llm_client_free(llm);http_global_cleanup();return 1;}
             pipeline_runner_set_backend(runner, backend);
         }
     }
@@ -353,8 +283,7 @@ int main(int argc, char **argv) {
     outcome_free(&result);
     pipeline_runner_free(runner);
     dot_graph_free(graph); /* Runner borrows graph and backend. */
-    free(backend_state);
-    free(backend);
+    agent_codergen_backend_free(backend);
     if (exec_env) exec_env_free(exec_env);
     if (llm) llm_client_free(llm);
     http_global_cleanup();

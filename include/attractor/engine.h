@@ -72,6 +72,8 @@ typedef struct {
     char *run_id;
     char *next_node; /* committed transition, never reconstructed from artifacts */
     char *pending_node; /* external effect may have happened; explicit recovery required */
+    char *current_node; /* last completed node, "" before the first */
+    JsonValue *completed_nodes; /* completed node IDs in order (spec 5.3) */
     bool complete;
     Outcome final_outcome;
     JsonValue *history; /* append-only attempts */
@@ -126,10 +128,14 @@ typedef struct CodergenBackend CodergenBackend;
 
 struct CodergenBackend {
     void *impl;
-    /* Returns a result string or NULL on error. Caller frees. */
-    /* Backend returns owned text bounded to ATTRACTOR_OUTPUT_LIMIT. */
-    char *(*run)(CodergenBackend *self, const DotNode *node,
-                 const char *prompt, const PipelineContext *ctx);
+    /* Returns owned text bounded to ATTRACTOR_OUTPUT_LIMIT, or NULL on error.
+     * `outcome` starts zeroed (STAGE_SUCCESS); the backend may set status,
+     * preferred_label, suggested_next_ids, notes and failure_reason with owned
+     * strings, which the handler takes over. Context updates are ignored.
+     * `stage_dir` is the node's artifact directory. A status.json written
+     * there during the call (Appendix C) overrides the returned outcome. */
+    char *(*run)(CodergenBackend *self, const DotNode *node, const char *prompt,
+                 const PipelineContext *ctx, const char *stage_dir, Outcome *outcome);
 };
 
 /*============================================================================
@@ -158,7 +164,7 @@ typedef struct {
 } Question;
 
 typedef enum {
-    ANSWER_INVALID, ANSWER_SELECTION, ANSWER_TIMEOUT, ANSWER_CANCELLED, ANSWER_EOF
+    ANSWER_INVALID, ANSWER_SELECTION, ANSWER_TIMEOUT, ANSWER_CANCELLED, ANSWER_EOF, ANSWER_SKIPPED
 } AnswerKind;
 
 typedef struct {
@@ -172,10 +178,18 @@ typedef struct Interviewer Interviewer;
 struct Interviewer {
     void *impl;
     Answer (*ask)(Interviewer *self, const Question *q);
+    void (*cleanup)(Interviewer *self); /* releases impl; may be NULL */
 };
+
+/* Returns an owned answer; userdata is borrowed. */
+typedef Answer (*InterviewerCallback)(const Question *q, void *userdata);
 
 Interviewer *auto_approve_interviewer_new(void);
 Interviewer *console_interviewer_new(void);
+/* Delegates every question to cb (spec 6.4). */
+Interviewer *callback_interviewer_new(InterviewerCallback cb, void *userdata);
+/* Answers with the copied values in order, then ANSWER_SKIPPED (spec 6.4). */
+Interviewer *queue_interviewer_new(const char *const *answers, size_t count);
 void         interviewer_free(Interviewer *iv);
 void         answer_free(Answer *a);
 
@@ -212,6 +226,13 @@ typedef void (*PipelineEventCallback)(const PipelineEvent *ev, void *userdata);
 
 typedef struct ExecutionEnv ExecutionEnv;
 
+/* Custom AST transform (spec 9.3); signal failure by setting g->failed. */
+typedef void (*GraphTransformFn)(DotGraph *g, void *userdata);
+typedef struct {
+    GraphTransformFn fn;
+    void            *userdata; /* borrowed */
+} GraphTransform;
+
 typedef struct {
     DotGraph         *graph; /* borrowed; caller releases after runner */
     HandlerRegistry   handler_reg;
@@ -223,10 +244,16 @@ typedef struct {
     PipelineEventCallback event_cb;
     void             *event_userdata;
     size_t            max_iterations; /* default 10000 */
+    unsigned          max_restarts; /* loop_restart budget per run, default 100 */
+    char             *restart_node; /* internal: pending loop_restart target */
     unsigned          child_depth;
     unsigned          max_child_depth; /* default 8 */
     bool              owns_interviewer;
     Checkpoint       *active_checkpoint; /* internal borrowed execution state */
+    GraphTransform   *transforms; /* owned array, registration order */
+    size_t            transform_count;
+    bool              transforms_applied;
+    bool              transforms_failed;
 } PipelineRunner;
 
 /* Create a runner for a parsed & validated graph */
@@ -236,6 +263,10 @@ void            pipeline_runner_set_execution_env(PipelineRunner *r, ExecutionEn
 void            pipeline_runner_set_backend(PipelineRunner *r, CodergenBackend *b);
 void            pipeline_runner_set_interviewer(PipelineRunner *r, Interviewer *iv);
 void            pipeline_runner_on_event(PipelineRunner *r, PipelineEventCallback cb, void *ud);
+/* Registers a custom transform. Before validation, the first run or resume
+ * applies them once, in registration order, after the built-in transforms the
+ * caller already applied; manager child graphs get them too. */
+bool            pipeline_runner_register_transform(PipelineRunner *r, GraphTransformFn fn, void *userdata);
 
 /* Register built-in handlers (start, exit, codergen, wait.human, conditional, parallel, fan-in, tool) */
 void pipeline_register_builtin_handlers(PipelineRunner *r);
@@ -266,11 +297,11 @@ char *ctx_to_preamble(const PipelineContext *ctx, const char *fidelity);
  *==========================================================================*/
 
 typedef struct {
-    char *selector;         /* "*", ".classname", "#nodeid" */
+    char *selector;         /* "*", shape, ".classname", "#nodeid" */
     char *llm_model;
     char *llm_provider;
     char *reasoning_effort;
-    int   specificity;      /* 0=universal, 1=class, 2=id */
+    int   specificity;      /* 0=universal, 1=shape, 2=class, 3=id */
 } StyleRule;
 
 typedef struct {

@@ -108,9 +108,14 @@ ExecResult *process_run(const ProcessOptions *o) {
         long long now=monotonic_ms();
         if(now<0 || now>=deadline || (o->cancel && *o->cancel) || out.failed || err.failed) {
             r->cancelled=o->cancel && *o->cancel;r->timed_out=now>=deadline;
+            /* SIGTERM, then up to 2s for a graceful exit, then SIGKILL (spec 5.4). */
             kill(-pid,SIGTERM);
-            struct timespec grace={0,100000000};while(nanosleep(&grace,&grace)<0 && errno==EINTR) {}
-            kill(-pid,SIGKILL);
+            for(int tick=0;tick<200 && !reaped;tick++) {
+                pid_t waited=waitpid(pid,&status,WNOHANG);
+                if(waited==pid) {reaped=true;break;}
+                struct timespec pause={0,10000000};while(nanosleep(&pause,&pause)<0 && errno==EINTR) {}
+            }
+            kill(-pid,SIGKILL); /* also reaps stragglers left in the group */
             if(!reaped) {pid_t waited;do {waited=waitpid(pid,&status,0);} while(waited<0 && errno==EINTR);if(waited==pid) reaped=true;else failure=errno;}
             break;
         }
