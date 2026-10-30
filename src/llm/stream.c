@@ -91,7 +91,7 @@ static bool emit(StreamSink *s, StreamEventType type, const char *delta, const c
 }
 
 void stream_sink_finish(StreamSink *s, LlmResponse *r) {
-    StreamEvent ev = {.type = STREAM_EVT_FINISH, .response = r, .usage = &r->usage, .finish_reason = &r->finish_reason};
+    StreamEvent ev = {.type = STREAM_EVT_FINISH, .response = r, .usage = r->usage, .finish_reason = r->finish_reason};
     deliver(s, &ev);
 }
 void stream_sink_fail(StreamSink *s, const char *message) {
@@ -112,9 +112,7 @@ static bool anthropic_event(StreamSink *s, const JsonValue *ev) {
     const char *type = json_get_string(ev, "type");
     if (str_eq(type, "message_start")) {
         json_free(s->message);
-        char *copy = json_serialize(json_get(ev, "message"));
-        s->message = copy ? json_parse(copy, NULL) : NULL;
-        free(copy);
+        s->message = json_clone(json_get(ev, "message"));
         if (!s->message || s->message->type != JSON_OBJECT) { fail(s, "Malformed message_start"); return false; }
         return true;
     }
@@ -324,9 +322,7 @@ static bool gemini_event(StreamSink *s, const JsonValue *ev) {
             if (!emit(s, STREAM_EVT_TEXT_DELTA, text, NULL, NULL, NULL)) return false;
         } else if (fc) {
             if (!gemini_flush_thought(s) || !gemini_flush_text(s)) return false;
-            char *copy = json_serialize(p);
-            if (!push_part(s, copy ? json_parse(copy, NULL) : NULL)) { free(copy); return false; }
-            free(copy);
+            if (!push_part(s, json_clone(p))) return false;
             char *args = json_serialize(json_get(fc, "args"));
             ToolCall call = {.name = (char *)json_get_string(fc, "name"), .arguments_json = args ? args : "{}"};
             bool ok = emit(s, STREAM_EVT_TOOL_CALL_START, NULL, NULL, &call, NULL) && emit(s, STREAM_EVT_TOOL_CALL_END, NULL, NULL, &call, NULL);
@@ -338,9 +334,8 @@ static bool gemini_event(StreamSink *s, const JsonValue *ev) {
     if (finish) { free(s->finish_reason); s->finish_reason = str_dup(finish); }
     const JsonValue *usage = json_get(ev, "usageMetadata");
     if (usage) {
-        char *copy = json_serialize(usage);
-        json_free(s->usage); s->usage = copy ? json_parse(copy, NULL) : NULL;
-        free(copy);
+        json_free(s->usage);
+        s->usage = json_clone(usage);
     }
     return true;
 }

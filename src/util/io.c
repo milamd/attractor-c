@@ -1,5 +1,6 @@
 #include "util/io.h"
 #include "util/str.h"
+#include "util/mem.h"
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
@@ -78,10 +79,16 @@ int io_open_workspace(const char *root,const char *path,int flags,unsigned mode,
 fail:{int error=errno;close(fd);free(copy);errno=error;return -1;}
 }
 char *io_artifact_name(const char *id) {
-    if(!id || !*id || strlen(id)>100) {errno=EINVAL;return NULL;}
-    StrBuf b;strbuf_init(&b);strbuf_append_cstr(&b,"node-");
-    for(const unsigned char *p=(const unsigned char *)id;*p;p++) strbuf_appendf(&b,"%02x",(unsigned)*p);
-    return strbuf_detach(&b);
+    static const char hex[]="0123456789abcdef";
+    if(!id || !*id) {errno=EINVAL;return NULL;}
+    size_t n=strnlen(id,101);if(n>100) {errno=EINVAL;return NULL;}
+    char *out=mem_alloc(5+n*2+1);if(!out) return NULL;
+    memcpy(out,"node-",5);
+    for(size_t i=0;i<n;i++) {
+        unsigned char c=(unsigned char)id[i];
+        out[5+i*2]=hex[c>>4];out[6+i*2]=hex[c&15];
+    }
+    out[5+n*2]=0;return out;
 }
 bool io_artifact_write(const char *root,const char *id,const char *name,const char *content) {
     char *component=io_artifact_name(id);if(!component) return false;

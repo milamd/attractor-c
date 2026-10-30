@@ -45,6 +45,7 @@ typedef struct {
     size_t       count;
     size_t       cap;
     size_t       byte_count; /* aggregate key/value bytes, bounded to input limit */
+    StrIndex     index; /* O(1) key -> slot index lookup */
     char       **logs;
     size_t       log_count;
     size_t       log_cap;
@@ -108,10 +109,9 @@ typedef struct {
 } Handler;
 
 typedef struct {
-    Handler **handlers;
+    Handler  *handlers;
     size_t    count;
     size_t    cap;
-    Handler  *default_handler;
     bool      failed;
 } HandlerRegistry;
 

@@ -21,21 +21,22 @@ static bool all_paths(const DotAdjacency *a,size_t node,size_t join,unsigned cha
 }
 const DotNode *dot_parallel_join(const DotGraph *g,const DotNode *fork,char **error) {
     if(error) *error=NULL;size_t n=g->node_count;
-    size_t *dist=mem_calloc(n,sizeof(*dist)),*queue=mem_calloc(n,sizeof(*queue));
-    size_t *hits=mem_calloc(n,sizeof(*hits)),*score=mem_calloc(n,sizeof(*score));
-    unsigned char *colors=mem_calloc(n,sizeof(*colors));size_t *owner=mem_calloc(n,sizeof(*owner));
+    size_t *scratch=n<=((SIZE_MAX/sizeof(size_t)-1)/6)?mem_calloc(n*5+((n+sizeof(size_t)-1)/sizeof(size_t)),sizeof(size_t)):NULL;
+    size_t *dist=scratch,*queue=scratch?scratch+n:NULL,*hits=scratch?scratch+n*2:NULL,*score=scratch?scratch+n*3:NULL,*owner=scratch?scratch+n*4:NULL;
+    unsigned char *colors=scratch?(unsigned char *)(scratch+n*5):NULL;
     const DotNode *result=NULL;const char *reason="Parallel allocation failed";size_t branches=0;
-    DotAdjacency adj={0};size_t origin=index_of(g,fork->id);
-    if(!dist || !queue || !hits || !score || !colors || !owner || !dot_adjacency_build(g,&adj)) goto done;
+    DotAdjacency owned={0};size_t origin=index_of(g,fork->id);
+    const DotAdjacency *adj=g->out_adj.offset?&g->out_adj:(dot_adjacency_build(g,&owned)?&owned:NULL);
+    if(!scratch || !adj) goto done;
     if(origin==SIZE_MAX) {reason="Unknown parallel fork";goto done;}
-    for(size_t e=adj.offset[origin];e<adj.offset[origin+1];e++) {
+    for(size_t e=adj->offset[origin];e<adj->offset[origin+1];e++) {
         branches++;for(size_t i=0;i<n;i++) dist[i]=SIZE_MAX;
-        size_t start=adj.target[e];if(start==SIZE_MAX) {reason="Unknown branch target";goto done;}
+        size_t start=adj->target[e];if(start==SIZE_MAX) {reason="Unknown branch target";goto done;}
         size_t head=0,tail=0;queue[tail++]=start;dist[start]=0;
         while(head<tail) {
             size_t current=queue[head++];hits[current]++;score[current]+=dist[current];
-            for(size_t k=adj.offset[current];k<adj.offset[current+1];k++) {
-                size_t to=adj.target[k];if(to!=SIZE_MAX && dist[to]==SIZE_MAX) {dist[to]=dist[current]+1;queue[tail++]=to;}
+            for(size_t k=adj->offset[current];k<adj->offset[current+1];k++) {
+                size_t to=adj->target[k];if(to!=SIZE_MAX && dist[to]==SIZE_MAX) {dist[to]=dist[current]+1;queue[tail++]=to;}
             }
         }
     }
@@ -47,9 +48,9 @@ const DotNode *dot_parallel_join(const DotGraph *g,const DotNode *fork,char **er
     }
     if(join==SIZE_MAX) {reason="Parallel branches require a common fan-in or terminal join";goto done;}
     size_t branch=0;
-    for(size_t e=adj.offset[origin];e<adj.offset[origin+1];e++) {
+    for(size_t e=adj->offset[origin];e<adj->offset[origin+1];e++) {
         branch++;for(size_t i=0;i<n;i++) colors[i]=0;
-        if(!all_paths(&adj,adj.target[e],join,colors,0)) {reason="Branch cycle, excessive depth, or path outside join region";goto done;}
+        if(!all_paths(adj,adj->target[e],join,colors,0)) {reason="Branch cycle, excessive depth, or path outside join region";goto done;}
         for(size_t i=0;i<n;i++) if(colors[i]) {
             if(owner[i] && owner[i]!=branch) {reason="Branches overlap before their join";goto done;}
             owner[i]=branch;
@@ -57,6 +58,6 @@ const DotNode *dot_parallel_join(const DotGraph *g,const DotNode *fork,char **er
     }
     result=&g->nodes[join];
 done:
-    free(dist);free(queue);free(hits);free(score);free(colors);free(owner);dot_adjacency_free(&adj);
+    free(scratch);dot_adjacency_free(&owned);
     if(!result && error) *error=str_dup(reason);return result;
 }

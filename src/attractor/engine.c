@@ -10,6 +10,7 @@
 #include "attractor/validator.h"
 #include "util/json.h"
 #include "util/str.h"
+#include "util/strindex.h"
 #include "util/io.h"
 #include "util/mem.h"
 #include "util/process.h"
@@ -130,6 +131,7 @@ void ctx_free(PipelineContext *c)
     }
     free(c->keys);
     free(c->values);
+    strindex_free(&c->index);
     for (size_t i = 0; i < c->log_count; i++)
         free(c->logs[i]);
     free(c->logs);
@@ -141,7 +143,11 @@ void ctx_set(PipelineContext *c, const char *key, const char *value)
     if (!c || !key || !value) {if(c) c->failed=true;return;}
     size_t key_bytes=strnlen(key,65537),value_bytes=strnlen(value,ATTRACTOR_INPUT_LIMIT+1),replacement=c->count;
     if(key_bytes>65536 || value_bytes>ATTRACTOR_INPUT_LIMIT) {c->failed=true;return;}
-    for(size_t i=0;i<c->count;i++) if(str_eq(c->keys[i],key)) {replacement=i;break;}
+    if (c->index.cap) {
+        if (!strindex_get(&c->index, key, &replacement)) replacement = c->count;
+    } else {
+        for(size_t i=0;i<c->count;i++) if(str_eq(c->keys[i],key)) {replacement=i;break;}
+    }
     size_t total=c->byte_count;
     if(replacement<c->count) total-=strlen(c->values[replacement]);else if(!size_add(total,key_bytes,&total)) {c->failed=true;return;}
     if(!size_add(total,value_bytes,&total) || total>ATTRACTOR_INPUT_LIMIT || (replacement==c->count && c->count>=10000)) {c->failed=true;return;}
@@ -155,11 +161,24 @@ void ctx_set(PipelineContext *c, const char *key, const char *value)
         char **values=mem_reallocarray(c->values,cap,sizeof(*values));
         if(!values) {free(copy);free(owned_key);c->failed=true;return;}c->values=values;c->cap=cap;
     }
+    if (!c->index.cap && c->count + 1 >= 16) {
+        for (size_t i = 0; i < c->count; i++) {
+            if (!strindex_put(&c->index, c->keys[i], i)) { strindex_free(&c->index); free(copy); free(owned_key); c->failed = true; return; }
+        }
+    }
+    if (c->index.cap && !strindex_put(&c->index, owned_key, c->count)) {
+        free(copy); free(owned_key); c->failed = true; return;
+    }
     c->keys[c->count]=owned_key;c->values[c->count++]=copy;c->byte_count=total;
 }
 
 const char *ctx_get(const PipelineContext *c, const char *key, const char *def)
 {
+    if (!c || !key) return def;
+    if (c->index.cap) {
+        size_t i;
+        return strindex_get(&c->index, key, &i) ? c->values[i] : def;
+    }
     for (size_t i = 0; i < c->count; i++) {
         if (str_eq(c->keys[i], key))
             return c->values[i];
@@ -277,10 +296,6 @@ char *ctx_to_preamble(const PipelineContext *ctx, const char *fidelity)
 
 /* ── 3. Checkpoint ───────────────────────────────────────────────────── */
 
-static JsonValue *json_copy(const JsonValue *v) {
-    char *encoded=json_serialize(v);if(!encoded) return NULL;
-    JsonValue *copy=json_parse(encoded,NULL);free(encoded);return copy;
-}
 static JsonValue *outcome_json(const Outcome *o) {
     JsonValue *j=json_new_object();
     json_object_set(j,"status",json_new_string(status_to_string(o->status)));
@@ -318,29 +333,56 @@ static bool outcome_from_json(Outcome *o,const JsonValue *j) {
 fail:outcome_free(o);return false;
 }
 static Outcome outcome_copy(const Outcome *source) {
-    JsonValue *j=outcome_json(source);Outcome o={.status=STAGE_FAIL};
-    if(!j || !outcome_from_json(&o,j)) o.failure_reason=str_dup("Cannot copy outcome");json_free(j);return o;
+    unsigned long failures = mem_failure_count();
+    Outcome o = { .status = source->status };
+    o.preferred_label = str_dup(str_safe(source->preferred_label));
+    o.notes = str_dup(str_safe(source->notes));
+    o.failure_reason = str_dup(str_safe(source->failure_reason));
+    if (source->suggested_next_count) {
+        o.suggested_next_ids = mem_calloc(source->suggested_next_count, sizeof(char *));
+        if (o.suggested_next_ids) {
+            for (size_t i = 0; i < source->suggested_next_count; i++)
+                o.suggested_next_ids[o.suggested_next_count++] = str_dup(str_safe(source->suggested_next_ids[i]));
+        }
+    }
+    if (source->update_count) {
+        o.update_keys = mem_calloc(source->update_count, sizeof(char *));
+        o.update_values = mem_calloc(source->update_count, sizeof(char *));
+        if (o.update_keys && o.update_values) {
+            for (size_t i = 0; i < source->update_count; i++) {
+                o.update_keys[i] = str_dup(str_safe(source->update_keys[i]));
+                o.update_values[i] = str_dup(str_safe(source->update_values[i]));
+                o.update_count++;
+            }
+        }
+    }
+    if (mem_failure_count() != failures) {
+        outcome_free(&o);
+        return (Outcome){ .status = STAGE_FAIL, .failure_reason = str_dup("Cannot copy outcome") };
+    }
+    return o;
 }
 bool checkpoint_save(const Checkpoint *cp,const char *path) {
     if(!cp || cp->version!=2 || !cp->graph_identity || !cp->run_id || cp->context.failed) return false;
     JsonValue *j=json_new_object();json_object_set(j,"version",json_new_number(2));
     json_object_set(j,"graph_identity",json_new_string(cp->graph_identity));json_object_set(j,"run_id",json_new_string(cp->run_id));
     json_object_set(j,"next_node",json_new_string(str_safe(cp->next_node)));json_object_set(j,"pending_node",json_new_string(str_safe(cp->pending_node)));
-    json_object_set(j,"current_node",json_new_string(str_safe(cp->current_node)));json_object_set(j,"completed_nodes",cp->completed_nodes?json_copy(cp->completed_nodes):json_new_array());
+    json_object_set(j,"current_node",json_new_string(str_safe(cp->current_node)));
     json_object_set(j,"complete",json_new_bool(cp->complete));json_object_set(j,"final_outcome",outcome_json(&cp->final_outcome));
     JsonValue *context=json_new_object(),*logs=json_new_array();
     for(size_t i=0;i<cp->context.count;i++) json_object_set(context,cp->context.keys[i],json_new_string(cp->context.values[i]));
     for(size_t i=0;i<cp->context.log_count;i++) json_array_push(logs,json_new_string(cp->context.logs[i]));
     json_object_set(j,"context",context);json_object_set(j,"logs",logs);
-    /* Splice the growing history/latest in serialized form instead of deep-copying
-     * them (a full serialize + parse) on every save. */
-    char *head=json_serialize(j),*history=json_serialize(cp->history),*latest=json_serialize(cp->latest);json_free(j);
+    /* Splice the growing completed_nodes/history/latest in serialized form
+     * instead of deep-copying them on every save. */
+    char *head=json_serialize(j),*completed=cp->completed_nodes?json_serialize(cp->completed_nodes):str_dup("[]");
+    char *history=json_serialize(cp->history),*latest=json_serialize(cp->latest);json_free(j);
     StrBuf b;strbuf_init(&b);
-    if(head && history && latest) {
+    if(head && completed && history && latest) {
         strbuf_append(&b,head,strlen(head)-1);
-        strbuf_appendf(&b,",\"history\":%s,\"latest\":%s}",history,latest);
+        strbuf_appendf(&b,",\"completed_nodes\":%s,\"history\":%s,\"latest\":%s}",completed,history,latest);
     } else b.failed=true;
-    free(head);free(history);free(latest);
+    free(head);free(completed);free(history);free(latest);
     char *encoded=strbuf_detach(&b);if(!encoded) return false;
     bool ok=io_atomic_write(path,encoded,IO_SYNC);free(encoded);return ok;
 }
@@ -371,7 +413,7 @@ bool checkpoint_load(Checkpoint *cp,const char *path) {
     for(size_t i=0;i<latest->object.count;i++) {Outcome o={0};if(!outcome_from_json(&o,latest->object.values[i])) goto fail;outcome_free(&o);}
     for(size_t i=0;i<context->object.count;i++) {JsonValue *v=context->object.values[i];if(v->type!=JSON_STRING) goto fail;ctx_set(&temporary.context,context->object.keys[i],v->string);}
     for(size_t i=0;i<logs->array.count;i++) {JsonValue *v=logs->array.items[i];if(v->type!=JSON_STRING) goto fail;ctx_append_log(&temporary.context,v->string);}
-    temporary.history=json_copy(history);temporary.latest=json_copy(latest);temporary.completed_nodes=json_copy(completed);temporary.current_node=str_dup(current);
+    temporary.history=json_clone(history);temporary.latest=json_clone(latest);temporary.completed_nodes=json_clone(completed);temporary.current_node=str_dup(current);
     if(temporary.context.failed || !temporary.history || !temporary.latest || !temporary.completed_nodes || !temporary.current_node) goto fail;
     checkpoint_free(cp);*cp=temporary;json_free(j);return true;
 fail:checkpoint_free(&temporary);json_free(j);return false;
@@ -416,14 +458,9 @@ void handler_registry_init(HandlerRegistry *reg)
 void handler_registry_free(HandlerRegistry *reg)
 {
     for (size_t i = 0; i < reg->count; i++) {
-        free(reg->handlers[i]->type_name);
-        free(reg->handlers[i]);
+        free(reg->handlers[i].type_name);
     }
     free(reg->handlers);
-    if (reg->default_handler) {
-        free(reg->default_handler->type_name);
-        free(reg->default_handler);
-    }
     memset(reg, 0, sizeof(*reg));
 }
 
@@ -432,29 +469,25 @@ void handler_registry_register(HandlerRegistry *reg, const char *type,
 {
     /* Replace if exists */
     for (size_t i = 0; i < reg->count; i++) {
-        if (str_eq(reg->handlers[i]->type_name, type)) {
-            reg->handlers[i]->execute = fn;
-            reg->handlers[i]->data    = data;
+        if (str_eq(reg->handlers[i].type_name, type)) {
+            reg->handlers[i].execute = fn;
+            reg->handlers[i].data    = data;
             return;
         }
     }
     /* Append */
     if (reg->count >= reg->cap) {
         size_t new_cap = reg->cap ? reg->cap * 2 : 8;
-        Handler **handlers=mem_reallocarray(reg->handlers,new_cap,sizeof(*handlers));
+        Handler *handlers=mem_reallocarray(reg->handlers,new_cap,sizeof(*handlers));
         if(!handlers) {reg->failed=true;return;}reg->handlers=handlers;reg->cap=new_cap;
     }
-    Handler *h = mem_calloc(1, sizeof(Handler));
-    if(!h) {reg->failed=true;return;}
-    h->type_name = str_dup(type);
-    if(!h->type_name || !fn) {reg->failed=true;free(h->type_name);free(h);return;}
-    h->execute   = fn;
-    h->data      = data;
-    reg->handlers[reg->count++] = h;
+    char *type_name = str_dup(type);
+    if(!type_name || !fn) {reg->failed=true;free(type_name);return;}
+    reg->handlers[reg->count++] = (Handler){.type_name = type_name, .execute = fn, .data = data};
 }
 
 static Handler *handler_registry_find(const HandlerRegistry *reg,const char *type) {
-    for(size_t i=0;i<reg->count;i++) if(str_eq(reg->handlers[i]->type_name,type)) return reg->handlers[i];
+    for(size_t i=0;i<reg->count;i++) if(str_eq(reg->handlers[i].type_name,type)) return &reg->handlers[i];
     return NULL;
 }
 /* Spec 4.2: the explicit type, then the shape's handler, then codergen. */
@@ -765,27 +798,16 @@ static char parse_accelerator(const char *label)
     return label[0];
 }
 
-/* Strip accelerator prefix patterns from a label for matching purposes. */
-static char *strip_accelerator(const char *label)
-{
-    if (!label) return str_dup("");
-    /* [K] Label */
-    if (label[0] == '[' && label[1] && label[2] == ']') {
-        const char *p = label + 3;
-        while (*p == ' ') p++;
-        return str_dup(p);
+static bool outgoing_slice(const DotGraph *g, const char *id, size_t *start, size_t *end) {
+    size_t idx;
+    if (!g || !id || !g->out_adj.offset || !g->node_index.cap) return false;
+    if (!strindex_get(&g->node_index, id, &idx) || idx >= g->node_count) {
+        *start = *end = 0;
+        return true;
     }
-    /* K) Label */
-    if (label[0] && label[1] == ')') {
-        const char *p = label + 2;
-        while (*p == ' ') p++;
-        return str_dup(p);
-    }
-    /* K - Label */
-    if (label[0] && label[1] == ' ' && label[2] == '-' && label[3] == ' ') {
-        return str_dup(label + 4);
-    }
-    return str_dup(label);
+    *start = g->out_adj.offset[idx];
+    *end = g->out_adj.offset[idx + 1];
+    return true;
 }
 
 static Outcome wait_human_handler(const DotNode *node, PipelineContext *ctx,
@@ -797,12 +819,14 @@ static Outcome wait_human_handler(const DotNode *node, PipelineContext *ctx,
     Outcome o;
     memset(&o, 0, sizeof(o));
 
-    /* Get outgoing edges */
-    const DotEdge **edges=mem_calloc(graph->edge_count,sizeof(*edges));
+    /* Get outgoing edges in O(deg+(node)) */
+    size_t out_total = dot_outgoing_edges(graph, node->id, NULL, 0);
+    const DotEdge **edges = mem_calloc(out_total ? out_total : 1, sizeof(*edges));
     if(!edges) return fail_outcome("Cannot collect human options");
+    dot_outgoing_edges(graph, node->id, edges, out_total);
     size_t edge_count=0;Outcome selection_outcome={.status=STAGE_SUCCESS};
-    for(size_t i=0;i<graph->edge_count;i++) {
-        const DotEdge *edge=&graph->edges[i];if(str_eq(edge->from,node->id) && evaluate_condition(edge->condition,&selection_outcome,ctx)) edges[edge_count++]=edge;
+    for(size_t i=0;i<out_total;i++) {
+        if(evaluate_condition(edges[i]->condition,&selection_outcome,ctx)) edges[edge_count++]=edges[i];
     }
     int seconds=parse_timeout_seconds(node->timeout);
     if(seconds<0) {free(edges);return fail_outcome("Invalid human timeout");}
@@ -914,7 +938,7 @@ static Outcome tool_handler(const DotNode *node,PipelineContext *ctx,const DotGr
 
 static bool registered_type(const char *type,void *data) {
     PipelineRunner *runner=data;
-    for(size_t i=0;i<runner->handler_reg.count;i++) if(str_eq(type,runner->handler_reg.handlers[i]->type_name)) return true;
+    for(size_t i=0;i<runner->handler_reg.count;i++) if(str_eq(type,runner->handler_reg.handlers[i].type_name)) return true;
     return false;
 }
 static PipelineRunner *inherited_runner(PipelineRunner *parent,DotGraph *graph,const char *logs) {
@@ -925,7 +949,7 @@ static PipelineRunner *inherited_runner(PipelineRunner *parent,DotGraph *graph,c
     child->max_iterations=parent->max_iterations;child->max_child_depth=parent->max_child_depth;child->child_depth=parent->child_depth+1;
     pipeline_register_builtin_handlers(child);
     for(size_t i=0;i<parent->handler_reg.count;i++) {
-        Handler *h=parent->handler_reg.handlers[i];
+        Handler *h=&parent->handler_reg.handlers[i];
         handler_registry_register(&child->handler_reg,h->type_name,h->execute,h->data==parent?child:h->data);
     }return child;
 }
@@ -940,9 +964,12 @@ static Outcome parallel_handler(const DotNode *node,PipelineContext *ctx,const D
     StrBuf scope_buf;strbuf_init(&scope_buf);strbuf_appendf(&scope_buf,"parallel.%s.%zu",r->active_checkpoint?r->active_checkpoint->run_id:node->id,instance);
     char *scope=strbuf_detach(&scope_buf),*fork_name=io_artifact_name(node->id);bool failed=false;
     if(!scope || !fork_name || !results) {free(scope);free(fork_name);ctx_free(base);free(base);json_free(results);return fail_outcome("Cannot initialize fork");}
-    for(size_t i=0;i<graph->edge_count;i++) if(str_eq(graph->edges[i].from,node->id)) total++;
-    for(size_t i=0;i<graph->edge_count;i++) {
-        const DotEdge *edge=&graph->edges[i];if(!str_eq(edge->from,node->id)) continue;
+    size_t out_start=0,out_end=graph->edge_count;bool indexed=outgoing_slice(graph,node->id,&out_start,&out_end);
+    total=indexed?(out_end-out_start):dot_outgoing_edges(graph,node->id,NULL,0);
+    char *owned_identity = (r->active_checkpoint && r->active_checkpoint->graph_identity) ? NULL : graph_identity(graph);
+    const char *identity = (r->active_checkpoint && r->active_checkpoint->graph_identity) ? r->active_checkpoint->graph_identity : owned_identity;
+    for(size_t i=out_start;i<out_end;i++) {
+        const DotEdge *edge=&graph->edges[indexed?graph->out_adj.edge[i]:i];if(!indexed && !str_eq(edge->from,node->id)) continue;
         char *branch_name=io_artifact_name(edge->to);StrBuf path;strbuf_init(&path);
         strbuf_appendf(&path,"%s/%s/fork-%s-%zu/%s",logs_root,fork_name,r->active_checkpoint?r->active_checkpoint->run_id:"direct",instance,str_safe(branch_name));free(branch_name);
         char *logs=strbuf_detach(&path);PipelineRunner *child=logs?inherited_runner(r,(DotGraph *)graph,logs):NULL;
@@ -951,17 +978,16 @@ static Outcome parallel_handler(const DotNode *node,PipelineContext *ctx,const D
             StrBuf cp_path;strbuf_init(&cp_path);strbuf_appendf(&cp_path,"%s/checkpoint.json",logs);char *saved=strbuf_detach(&cp_path);
             bool exists=saved && access(saved,F_OK)==0;
             bool loaded=exists && checkpoint_load(&cp,saved);free(saved);
-            char *identity=graph_identity(graph);
             const DotNode *pending=cp.pending_node?dot_find_node(graph,cp.pending_node):NULL;
             bool recoverable=!cp.pending_node || !*cp.pending_node || (pending && (str_eq(dot_node_role(pending),"parallel") || str_eq(dot_node_role(pending),"stack.manager_loop")));
-            bool compatible=loaded && identity && str_eq(cp.graph_identity,identity);free(identity);
+            bool compatible=loaded && identity && str_eq(cp.graph_identity,identity);
             if(exists && (!compatible || !recoverable)) {outcome_free(&branch);branch=fail_outcome("Ambiguous or corrupt branch checkpoint");}
             else if(loaded || initial_checkpoint(child,&cp,edge->to,base)) {
                 /* Spec 3.8: the branch context stays isolated; only its outcome is collected. */
                 outcome_free(&branch);branch=execute_graph(child,&cp,join->id);
                 if(r->active_checkpoint) {
-                    for(size_t h=0;h<cp.history->array.count;h++) json_array_push(r->active_checkpoint->history,json_copy(cp.history->array.items[h]));
-                    for(size_t k=0;k<cp.latest->object.count;k++) json_object_set(r->active_checkpoint->latest,cp.latest->object.keys[k],json_copy(cp.latest->object.values[k]));
+                    for(size_t h=0;h<cp.history->array.count;h++) json_array_push(r->active_checkpoint->history,json_clone(cp.history->array.items[h]));
+                    for(size_t k=0;k<cp.latest->object.count;k++) json_object_set(r->active_checkpoint->latest,cp.latest->object.keys[k],json_clone(cp.latest->object.values[k]));
                 }
             }
         }
@@ -970,6 +996,7 @@ static Outcome parallel_handler(const DotNode *node,PipelineContext *ctx,const D
         checkpoint_free(&cp);pipeline_runner_free(child);free(logs);outcome_free(&branch);
         if((failures && str_eq(policy,"fail_fast")) || (successes && str_eq(join_policy,"first_success"))) break;
     }
+    free(owned_identity);
     char *encoded=json_serialize(results);json_free(results);
     if(encoded) {ctx_set(ctx,scope,encoded);ctx_set(ctx,"parallel.results",encoded);}else failed=true;
     free(encoded);free(scope);free(fork_name);ctx_free(base);free(base);
@@ -1103,15 +1130,35 @@ void pipeline_register_builtin_handlers(PipelineRunner *r)
 
 /* ── 8. Edge Selection Algorithm ─────────────────────────────────────── */
 
-/* Normalize a label for matching: lowercase, trim, strip accelerator prefix. */
-static char *normalize_label(const char *label)
+/* Zero-allocation normalized label span: strips accelerator prefix and trims whitespace. */
+static void normalized_label_span(const char *label, const char **out_start, size_t *out_len)
 {
-    if (!label) return str_dup("");
-    char *stripped = strip_accelerator(label);
-    char *trimmed  = str_trim(stripped);
-    char *lowered  = str_lower(str_dup(trimmed));
-    free(stripped);
-    return lowered;
+    if (!label) { *out_start = ""; *out_len = 0; return; }
+    const char *p = label;
+    if (p[0] == '[' && p[1] && p[2] == ']') {
+        p += 3;
+        while (*p == ' ') p++;
+    } else if (p[0] && p[1] == ')') {
+        p += 2;
+        while (*p == ' ') p++;
+    } else if (p[0] && p[1] == ' ' && p[2] == '-' && p[3] == ' ') {
+        p += 4;
+    }
+    while (*p && isspace((unsigned char)*p)) p++;
+    const char *end = p + strlen(p);
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    *out_start = p;
+    *out_len = (size_t)(end - p);
+}
+
+static bool label_span_eq(const char *a, size_t a_len, const char *b, size_t b_len)
+{
+    if (a_len != b_len) return false;
+    for (size_t i = 0; i < a_len; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
+            return false;
+    }
+    return true;
 }
 
 static int compare_edges_weight_lexical(const DotEdge *a, const DotEdge *b)
@@ -1124,10 +1171,13 @@ static int compare_edges_weight_lexical(const DotEdge *a, const DotEdge *b)
 
 static const DotEdge *select_edge(const DotGraph *graph,const char *id,const Outcome *o,const PipelineContext *ctx) {
     const DotEdge *conditional=NULL,*fallback=NULL,*label=NULL,*suggested=NULL;
-    char *preferred=o->preferred_label?normalize_label(o->preferred_label):NULL;
+    const char *pref_start=NULL;size_t pref_len=0;
+    if(o->preferred_label) normalized_label_span(o->preferred_label,&pref_start,&pref_len);
     bool failed=o->status==STAGE_FAIL || o->status==STAGE_RETRY;
-    for(size_t i=0;i<graph->edge_count;i++) {
-        const DotEdge *e=&graph->edges[i];if(!str_eq(e->from,id)) continue;
+    size_t start=0,end=graph->edge_count;bool indexed=outgoing_slice(graph,id,&start,&end);
+    for(size_t i=start;i<end;i++) {
+        const DotEdge *e=&graph->edges[indexed?graph->out_adj.edge[i]:i];
+        if(!indexed && !str_eq(e->from,id)) continue;
         bool has_condition=e->condition && *e->condition;
         if(has_condition) {
             if(evaluate_condition(e->condition,o,ctx) && (!conditional || compare_edges_weight_lexical(conditional,e)>0)) conditional=e;
@@ -1136,15 +1186,15 @@ static const DotEdge *select_edge(const DotGraph *graph,const char *id,const Out
         /* Failure may only recover through a matched conditional or an
          * explicitly designated suggested recovery edge / retry target. */
         if(!failed && (!fallback || compare_edges_weight_lexical(fallback,e)>0)) fallback=e;
-        if(!failed && preferred && e->label) {
-            char *norm=normalize_label(e->label);bool match=str_eq(preferred,norm);free(norm);
-            if(match && (!label || compare_edges_weight_lexical(label,e)>0)) label=e;
+        if(!failed && o->preferred_label && e->label) {
+            const char *e_start;size_t e_len;normalized_label_span(e->label,&e_start,&e_len);
+            if(label_span_eq(pref_start,pref_len,e_start,e_len) && (!label || compare_edges_weight_lexical(label,e)>0)) label=e;
         }
         for(size_t j=0;j<o->suggested_next_count;j++) if(str_eq(e->to,o->suggested_next_ids[j])) {
             if(!suggested || compare_edges_weight_lexical(suggested,e)>0) suggested=e;
         }
     }
-    free(preferred);return conditional?conditional:label?label:suggested?suggested:fallback;
+    return conditional?conditional:label?label:suggested?suggested:fallback;
 }
 
 /* ── 9. Goal Gate Checking ───────────────────────────────────────────── */
@@ -1359,9 +1409,10 @@ static Outcome execute_graph(PipelineRunner *r,Checkpoint *cp,const char *bounda
         bool denied_human=str_eq(dot_node_role(node),"wait.human") && step.status!=STAGE_SUCCESS;
         if(str_eq(dot_node_role(node),"parallel") && step.status==STAGE_SUCCESS && step.suggested_next_count==1) next=step.suggested_next_ids[0];
         if(str_eq(dot_node_role(node),"wait.human") && step.status==STAGE_SUCCESS && step.suggested_next_count==1) {
-            for(size_t i=0;i<r->graph->edge_count;i++) {
-                const DotEdge *candidate=&r->graph->edges[i];
-                if(str_eq(candidate->from,node->id) && str_eq(candidate->to,step.suggested_next_ids[0]) && evaluate_condition(candidate->condition,&step,&cp->context)) {next=candidate->to;break;}
+            size_t out_start=0,out_end=r->graph->edge_count;bool indexed=outgoing_slice(r->graph,node->id,&out_start,&out_end);
+            for(size_t i=out_start;i<out_end;i++) {
+                const DotEdge *candidate=&r->graph->edges[indexed?r->graph->out_adj.edge[i]:i];
+                if((indexed || str_eq(candidate->from,node->id)) && str_eq(candidate->to,step.suggested_next_ids[0]) && evaluate_condition(candidate->condition,&step,&cp->context)) {next=candidate->to;break;}
             }
             if(!next) denied_human=true;
         }
@@ -1516,6 +1567,9 @@ void transform_apply_stylesheet(DotGraph *g)
  *   selector { prop: value; prop: value; }
  * Selectors (specificity): "*" (0), shape name (1), ".classname" (2), "#nodeid" (3)
  */
+static bool span_eq_lit(const char *s,size_t len,const char *lit) {
+    return strlen(lit)==len && memcmp(s,lit,len)==0;
+}
 Stylesheet *stylesheet_parse(const char *src,char **err) {
     if(err) *err=NULL;
     if(!src || !*src || strnlen(src,ATTRACTOR_INPUT_LIMIT+1)>ATTRACTOR_INPUT_LIMIT) {if(err) *err=str_dup("Empty/oversized stylesheet");return NULL;}
@@ -1536,16 +1590,19 @@ Stylesheet *stylesheet_parse(const char *src,char **err) {
             while(isspace((unsigned char)*p)) p++;if(*p=='}') {p++;break;}if(!*p) goto fail;
             start=p;while(*p && *p!=':' && *p!='}' && *p!=';') p++;
             if(*p!=':') goto fail;
-            char *property=str_ndup(start,(size_t)(p-start));if(!property) goto fail;p++;
-            start=p;while(*p && *p!=';' && *p!='}') p++;
-            if(!*p) {free(property);goto fail;}
-            char *raw=str_ndup(start,(size_t)(p-start));if(!raw) {free(property);goto fail;}
-            char *value=str_trim(raw),*key=str_trim(property),**field=NULL;
-            if(str_eq(key,"llm_model") || str_eq(key,"model")) field=&rule.llm_model;
-            else if(str_eq(key,"llm_provider") || str_eq(key,"provider")) field=&rule.llm_provider;
-            else if(str_eq(key,"reasoning_effort") || str_eq(key,"reasoning")) field=&rule.reasoning_effort;
-            if(!field || !*value) {free(property);free(raw);goto fail;}
-            char *copy=str_dup(value);free(raw);free(property);if(!copy) goto fail;free(*field);*field=copy;
+            const char *kend=p;while(kend>start && isspace((unsigned char)kend[-1])) kend--;
+            size_t klen=(size_t)(kend-start);p++;
+            while(*p && isspace((unsigned char)*p) && *p!=';' && *p!='}') p++;
+            const char *vstart=p;while(*p && *p!=';' && *p!='}') p++;
+            if(!*p) goto fail;
+            const char *vend=p;while(vend>vstart && isspace((unsigned char)vend[-1])) vend--;
+            size_t vlen=(size_t)(vend-vstart);
+            char **field=NULL;
+            if(span_eq_lit(start,klen,"llm_model") || span_eq_lit(start,klen,"model")) field=&rule.llm_model;
+            else if(span_eq_lit(start,klen,"llm_provider") || span_eq_lit(start,klen,"provider")) field=&rule.llm_provider;
+            else if(span_eq_lit(start,klen,"reasoning_effort") || span_eq_lit(start,klen,"reasoning")) field=&rule.reasoning_effort;
+            if(!field || !vlen) goto fail;
+            char *copy=str_ndup(vstart,vlen);if(!copy) goto fail;free(*field);*field=copy;
             if(*p==';') p++;
         }
         if(sheet->count>=4096) {reason="Stylesheet rule limit";goto fail;}
@@ -1610,6 +1667,10 @@ void stylesheet_apply(const Stylesheet *s,DotGraph *g) {
     if(!s || !g) return;
     for(size_t i=0;i<g->node_count;i++) {
         DotNode *node=&g->nodes[i];
+        bool has_model = node->llm_model && *node->llm_model;
+        bool has_provider = node->llm_provider && *node->llm_provider;
+        bool has_effort = node->reasoning_effort && *node->reasoning_effort;
+        if(has_model && has_provider && has_effort) continue;
         const StyleRule *model=NULL,*provider=NULL,*effort=NULL;
         for(size_t k=0;k<s->count;k++) {
             const StyleRule *r=&s->rules[k];if(!selector_matches(r,node)) continue;
@@ -1617,9 +1678,9 @@ void stylesheet_apply(const Stylesheet *s,DotGraph *g) {
             if(r->llm_provider && (!provider || r->specificity>=provider->specificity)) provider=r;
             if(r->reasoning_effort && (!effort || r->specificity>=effort->specificity)) effort=r;
         }
-        if(model && !(node->llm_model && *node->llm_model)) apply_style_value(&node->llm_model,model->llm_model);
-        if(provider && !(node->llm_provider && *node->llm_provider)) apply_style_value(&node->llm_provider,provider->llm_provider);
-        if(effort && !(node->reasoning_effort && *node->reasoning_effort)) apply_style_value(&node->reasoning_effort,effort->reasoning_effort);
+        if(model && !has_model) apply_style_value(&node->llm_model,model->llm_model);
+        if(provider && !has_provider) apply_style_value(&node->llm_provider,provider->llm_provider);
+        if(effort && !has_effort) apply_style_value(&node->reasoning_effort,effort->reasoning_effort);
     }
 }
 

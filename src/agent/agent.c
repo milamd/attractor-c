@@ -292,8 +292,7 @@ void tool_registry_init(ToolRegistry *reg) {
 
 void tool_registry_free(ToolRegistry *reg) {
     for (size_t i = 0; i < reg->count; i++) {
-        tool_definition_free(&reg->tools[i]->def);
-        free(reg->tools[i]);
+        tool_definition_free(&reg->tools[i].def);
     }
     free(reg->tools);
 }
@@ -304,27 +303,27 @@ void tool_registry_register(ToolRegistry *reg, RegisteredTool *tool) {
     }
     /* Replace if exists */
     for (size_t i = 0; i < reg->count; i++) {
-        if (str_eq(reg->tools[i]->def.name, tool->def.name)) {
-            tool_definition_free(&reg->tools[i]->def);
-            free(reg->tools[i]);
-            reg->tools[i] = tool;
+        if (str_eq(reg->tools[i].def.name, tool->def.name)) {
+            tool_definition_free(&reg->tools[i].def);
+            reg->tools[i] = *tool;
+            free(tool);
             return;
         }
     }
     if (reg->count >= reg->cap) {
         size_t cap=reg->cap?reg->cap*2:8;
-        RegisteredTool **tools=mem_reallocarray(reg->tools,cap,sizeof(*tools));
+        RegisteredTool *tools=mem_reallocarray(reg->tools,cap,sizeof(*tools));
         if(!tools) {reg->failed=true;tool_definition_free(&tool->def);free(tool);return;}reg->tools=tools;reg->cap=cap;
     }
-    reg->tools[reg->count++] = tool;
+    reg->tools[reg->count++] = *tool;
+    free(tool);
 }
 
 void tool_registry_unregister(ToolRegistry *reg, const char *name) {
     for (size_t i = 0; i < reg->count; i++) {
-        if (str_eq(reg->tools[i]->def.name, name)) {
-            tool_definition_free(&reg->tools[i]->def);
-            free(reg->tools[i]);
-            memmove(&reg->tools[i], &reg->tools[i+1], (reg->count - i - 1) * sizeof(RegisteredTool *));
+        if (str_eq(reg->tools[i].def.name, name)) {
+            tool_definition_free(&reg->tools[i].def);
+            memmove(&reg->tools[i], &reg->tools[i+1], (reg->count - i - 1) * sizeof(*reg->tools));
             reg->count--;
             return;
         }
@@ -333,8 +332,8 @@ void tool_registry_unregister(ToolRegistry *reg, const char *name) {
 
 RegisteredTool *tool_registry_get(const ToolRegistry *reg, const char *name) {
     for (size_t i = 0; i < reg->count; i++) {
-        if (str_eq(reg->tools[i]->def.name, name))
-            return reg->tools[i];
+        if (str_eq(reg->tools[i].def.name, name))
+            return &reg->tools[i];
     }
     return NULL;
 }
@@ -543,82 +542,28 @@ static void register_tool(ToolRegistry *reg,const char *name,const char *descrip
 }
 
 void agent_register_core_tools(ToolRegistry *reg) {
-    /* read_file */
-    {
-        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
-        if(!t) {reg->failed=true;return;}
-        t->def.name = str_dup("read_file");
-        t->def.description = str_dup("Read a file from the filesystem. Returns line-numbered content.");
-        t->def.parameters_json = str_dup(
-            "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},"
-            "\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},"
-            "\"required\":[\"file_path\"]}");
-        t->execute = tool_read_file;
-        tool_registry_register(reg, t);
-    }
-    /* write_file */
-    {
-        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
-        if(!t) {reg->failed=true;return;}
-        t->def.name = str_dup("write_file");
-        t->def.description = str_dup("Write content to a file. Creates parent directories if needed.");
-        t->def.parameters_json = str_dup(
-            "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},"
-            "\"content\":{\"type\":\"string\"}},\"required\":[\"file_path\",\"content\"]}");
-        t->execute = tool_write_file;
-        tool_registry_register(reg, t);
-    }
-    /* edit_file */
-    {
-        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
-        if(!t) {reg->failed=true;return;}
-        t->def.name = str_dup("edit_file");
-        t->def.description = str_dup("Replace an exact string occurrence in a file.");
-        t->def.parameters_json = str_dup(
-            "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},"
-            "\"old_string\":{\"type\":\"string\"},\"new_string\":{\"type\":\"string\"},"
-            "\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"file_path\",\"old_string\",\"new_string\"]}");
-        t->execute = tool_edit_file;
-        tool_registry_register(reg, t);
-    }
-    /* shell */
-    {
-        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
-        if(!t) {reg->failed=true;return;}
-        t->def.name = str_dup("shell");
-        t->def.description = str_dup("Execute a shell command. Returns stdout, stderr, and exit code.");
-        t->def.parameters_json = str_dup(
-            "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},"
-            "\"timeout_ms\":{\"type\":\"integer\"},\"description\":{\"type\":\"string\"}},"
-            "\"required\":[\"command\"]}");
-        t->execute = tool_shell;
-        tool_registry_register(reg, t);
-    }
-    /* grep */
-    {
-        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
-        if(!t) {reg->failed=true;return;}
-        t->def.name = str_dup("grep");
-        t->def.description = str_dup("Search file contents using regex patterns.");
-        t->def.parameters_json = str_dup(
-            "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},"
-            "\"path\":{\"type\":\"string\"},\"case_insensitive\":{\"type\":\"boolean\"},"
-            "\"max_results\":{\"type\":\"integer\"}},\"required\":[\"pattern\"]}");
-        t->execute = tool_grep_fn;
-        tool_registry_register(reg, t);
-    }
-    /* glob */
-    {
-        RegisteredTool *t = mem_calloc(1, sizeof(RegisteredTool));
-        if(!t) {reg->failed=true;return;}
-        t->def.name = str_dup("glob");
-        t->def.description = str_dup("Find files matching a glob pattern.");
-        t->def.parameters_json = str_dup(
-            "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},"
-            "\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}");
-        t->execute = tool_glob_fn;
-        tool_registry_register(reg, t);
-    }
+    register_tool(reg,"read_file","Read a file from the filesystem. Returns line-numbered content.",
+        "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},"
+        "\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},"
+        "\"required\":[\"file_path\"]}",tool_read_file);
+    register_tool(reg,"write_file","Write content to a file. Creates parent directories if needed.",
+        "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},"
+        "\"content\":{\"type\":\"string\"}},\"required\":[\"file_path\",\"content\"]}",tool_write_file);
+    register_tool(reg,"edit_file","Replace an exact string occurrence in a file.",
+        "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},"
+        "\"old_string\":{\"type\":\"string\"},\"new_string\":{\"type\":\"string\"},"
+        "\"replace_all\":{\"type\":\"boolean\"}},\"required\":[\"file_path\",\"old_string\",\"new_string\"]}",tool_edit_file);
+    register_tool(reg,"shell","Execute a shell command. Returns stdout, stderr, and exit code.",
+        "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},"
+        "\"timeout_ms\":{\"type\":\"integer\"},\"description\":{\"type\":\"string\"}},"
+        "\"required\":[\"command\"]}",tool_shell);
+    register_tool(reg,"grep","Search file contents using regex patterns.",
+        "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\"},\"case_insensitive\":{\"type\":\"boolean\"},"
+        "\"max_results\":{\"type\":\"integer\"}},\"required\":[\"pattern\"]}",tool_grep_fn);
+    register_tool(reg,"glob","Find files matching a glob pattern.",
+        "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}",tool_glob_fn);
 }
 
 /*============================================================================
@@ -790,7 +735,7 @@ void agent_session_free(AgentSession *s) {
     for (size_t i = 0; i < s->steering_count; i++)
         free(s->steering_queue[i]);
     free(s->steering_queue);
-    for (size_t i = 0; i < s->followup_count; i++)
+    for (size_t i = s->followup_head; i < s->followup_count; i++)
         free(s->followup_queue[i]);
     free(s->followup_queue);
     free(s);
@@ -808,14 +753,36 @@ static void queue_message(AgentSession *s,char ***queue,size_t *count,const char
     if(!items) {free(owned);s->failed=true;return;}*queue=items;items[(*count)++]=owned;
 }
 void agent_session_steer(AgentSession *s,const char *text) {queue_message(s,&s->steering_queue,&s->steering_count,text);}
-void agent_session_follow_up(AgentSession *s,const char *text) {queue_message(s,&s->followup_queue,&s->followup_count,text);}
+void agent_session_follow_up(AgentSession *s,const char *text) {
+    if(s->followup_head==s->followup_count) s->followup_head=s->followup_count=0;
+    queue_message(s,&s->followup_queue,&s->followup_count,text);
+}
+static char *dequeue_followup(AgentSession *s) {
+    if(s->followup_head>=s->followup_count) return NULL;
+    char *next=s->followup_queue[s->followup_head++];
+    if(s->followup_head==s->followup_count) s->followup_head=s->followup_count=0;
+    return next;
+}
 void agent_session_abort(AgentSession *s) {s->abort_signaled=true;}
+static size_t message_chars(const Message *m) {
+    size_t chars=0;
+    for(size_t j=0;m && j<m->part_count;j++) {
+        const ContentPart *p=m->parts[j];
+        if(p->text) chars+=strlen(p->text);
+        if(p->tool_call) chars+=strlen(str_safe(p->tool_call->name))+strlen(str_safe(p->tool_call->arguments_json));
+        if(p->tool_result) chars+=strlen(str_safe(p->tool_result->content));
+        if(p->thinking) chars+=strlen(str_safe(p->thinking->text));
+    }
+    return chars;
+}
 static void session_add_message(AgentSession *s,Message *m) {
     if(!m || s->history_count>=4096) {message_free(m);s->failed=true;return;}
     if(s->history_count>=s->history_cap) {
         size_t cap=s->history_cap*2;Message **messages=mem_reallocarray(s->history,cap,sizeof(*messages));
         if(!messages) {message_free(m);s->failed=true;return;}s->history=messages;s->history_cap=cap;
-    }s->history[s->history_count++]=m;
+    }
+    s->history_chars+=message_chars(m);
+    s->history[s->history_count++]=m;
 }
 
 static void drain_steering(AgentSession *s) {
@@ -856,18 +823,7 @@ static bool detect_loop(AgentSession *s) {
 /* Context window awareness (spec 5.5): ~4 characters per token; warn past 80%. */
 static void check_context_usage(AgentSession *s) {
     if (s->profile->context_window_size <= 0) return;
-    size_t chars = 0;
-    for (size_t i = 0; i < s->history_count; i++) {
-        const Message *m = s->history[i];
-        for (size_t j = 0; j < m->part_count; j++) {
-            const ContentPart *p = m->parts[j];
-            if (p->text) chars += strlen(p->text);
-            if (p->tool_call) chars += strlen(str_safe(p->tool_call->name)) + strlen(str_safe(p->tool_call->arguments_json));
-            if (p->tool_result) chars += strlen(str_safe(p->tool_result->content));
-            if (p->thinking) chars += strlen(str_safe(p->thinking->text));
-        }
-    }
-    size_t tokens = chars / 4, window = (size_t)s->profile->context_window_size;
+    size_t tokens = s->history_chars / 4, window = (size_t)s->profile->context_window_size;
     if (tokens * 5 <= window * 4) return;
     char warning[96];
     snprintf(warning, sizeof(warning), "Context usage at ~%zu%% of context window", (tokens * 100 + window / 2) / window);
@@ -1020,12 +976,12 @@ static char *subagent_spawn(AgentSession *s, const JsonValue *args, const char *
 static char *subagent_wait(struct SubAgent *a) {
     AgentSession *child = a->session;
     if (!a->started) { a->started = true; agent_session_submit(child, a->task); }
-    else if (child->followup_count && !child->failed) {
-        char *next = child->followup_queue[0];
-        memmove(child->followup_queue, child->followup_queue + 1, (child->followup_count - 1) * sizeof(char *));
-        child->followup_count--;
-        agent_session_submit(child, next);
-        free(next);
+    else if (!child->failed) {
+        char *next = dequeue_followup(child);
+        if (next) {
+            agent_session_submit(child, next);
+            free(next);
+        }
     }
     char *output = NULL; size_t turns = 0;
     for (size_t i = 0; i < child->history_count; i++) if (child->history[i]->role == ROLE_ASSISTANT) turns++;
@@ -1091,7 +1047,7 @@ static void submit_one(AgentSession *s, const char *input) {
     size_t tool_count=reg->count+(offers_subagents(s)?SUBAGENT_TOOL_COUNT:0);
     ToolDefinition **tool_defs=mem_calloc(tool_count?tool_count:1,sizeof(*tool_defs));
     if(!tool_defs) {s->failed=true;s->state=SESSION_IDLE;return;}
-    for(size_t i=0;i<reg->count;i++) tool_defs[i]=&reg->tools[i]->def;
+    for(size_t i=0;i<reg->count;i++) tool_defs[i]=&reg->tools[i].def;
     for(size_t i=reg->count;i<tool_count;i++) tool_defs[i]=&subagent_tools[i-reg->count];
 
     int round_count = 0;
@@ -1233,10 +1189,8 @@ void agent_session_submit(AgentSession *s,const char *input) {
     const char *next=input;char *owned=NULL;
     for(size_t processed=0;processed<128 && next && !s->abort_signaled && !s->failed;processed++) {
         if(s->config.max_turns>0 && s->turn_count >= (size_t)s->config.max_turns) {emit(s,AGENT_EVT_TURN_LIMIT,"Turn limit reached",NULL,NULL);break;}
-        s->turn_count++;submit_one(s,next);free(owned);owned=NULL;next=NULL;
-        if(s->followup_count) {
-            owned=s->followup_queue[0];memmove(s->followup_queue,s->followup_queue+1,(s->followup_count-1)*sizeof(char *));s->followup_count--;next=owned;
-        }
+        s->turn_count++;submit_one(s,next);free(owned);
+        owned=dequeue_followup(s);next=owned;
     }
     free(owned);
 }
@@ -1307,14 +1261,16 @@ static char *tool_run(const char *arguments_json,ToolExecutionContext *context,c
     if(!context || !context->tool || !context->tool->execute || !context->env) {category="configuration";message="Unknown tool or missing environment";}
     else if(!core_arguments_valid(args,&context->tool->def)) {category="arguments";message="Missing or invalid tool arguments";}
     else {
-        if(str_eq(context->tool->def.name,"shell")) {
+        bool is_shell=str_eq(context->tool->def.name,"shell");
+        if(is_shell) {
             int duration=json_get_int(args,"timeout_ms",context->default_timeout_ms);
             if(duration<=0 || context->max_timeout_ms<=0) {category="arguments";message="Invalid command timeout";}
             else json_object_set(args,"timeout_ms",json_new_number(duration>context->max_timeout_ms?context->max_timeout_ms:duration));
         }
         if(!category) {
-            char *encoded=json_serialize(args);
-            output=encoded?context->tool->execute(encoded,context->env,&execution_error):NULL;free(encoded);
+            char *encoded=is_shell?json_serialize(args):NULL;
+            const char *payload=is_shell?encoded:arguments_json;
+            output=payload?context->tool->execute(payload,context->env,&execution_error):NULL;free(encoded);
             if(!output) {category="execution";message="Tool execution failed";}
             else if(execution_error) category="execution";
             else if(strlen(output)>ATTRACTOR_OUTPUT_LIMIT) {category="output_limit";message="Tool output exceeded limit";}

@@ -28,7 +28,7 @@ static void c_locale_init(void) {c_locale=newlocale(LC_NUMERIC_MASK,"C",NULL);}
 static locale_t numeric_locale(void) {pthread_once(&c_locale_once,c_locale_init);return c_locale;}
 
 typedef struct {const char *s; size_t pos,depth; const char *err;} Parser;
-static void ws(Parser *p) {while(p->s[p->pos] && strchr(" \r\n\t",p->s[p->pos])) p->pos++;}
+static void ws(Parser *p) {char c;while((c=p->s[p->pos])==' ' || c=='\n' || c=='\r' || c=='\t') p->pos++;}
 static JsonValue *alloc_value(JsonType t) {
     JsonValue *v=mem_calloc(1,sizeof(*v)); if(v) v->type=t; return v;
 }
@@ -70,27 +70,29 @@ static char *string_raw(Parser *p) {
     if(p->s[p->pos]!='"') {p->err="expected string";return NULL;}
     p->pos++; StrBuf b;strbuf_init(&b);
     while(p->s[p->pos] && p->s[p->pos]!='"') {
+        size_t start=p->pos;
+        while((unsigned char)p->s[p->pos]>=0x20 && p->s[p->pos]!='"' && p->s[p->pos]!='\\') p->pos++;
+        if(p->pos>start) strbuf_append(&b,p->s+start,p->pos-start);
+        if(!p->s[p->pos] || p->s[p->pos]=='"') break;
         unsigned char c=(unsigned char)p->s[p->pos++];
         if(c<0x20) {p->err="control character in string";goto fail;}
-        if(c=='\\') {
-            char e=p->s[p->pos]; if(!e) {p->err="incomplete escape";goto fail;} p->pos++;
-            switch(e) {
-                case '"': c='"';break; case '\\':c='\\';break;case '/':c='/';break;
-                case 'b':c='\b';break;case 'f':c='\f';break;case 'n':c='\n';break;case 'r':c='\r';break;case 't':c='\t';break;
-                case 'u': {
-                    unsigned cp,lo;
-                    if(!hex4(p,&cp)) {p->err="invalid Unicode escape";goto fail;}
-                    if(cp>=0xd800 && cp<=0xdbff) {
-                        if(p->s[p->pos]!='\\' || p->s[p->pos+1]!='u') {p->err="missing low surrogate";goto fail;}
-                        p->pos+=2;
-                        if(!hex4(p,&lo) || lo<0xdc00 || lo>0xdfff) {p->err="invalid low surrogate";goto fail;}
-                        cp=0x10000+((cp-0xd800)<<10)+(lo-0xdc00);
-                    } else if(cp>=0xdc00 && cp<=0xdfff) {p->err="unpaired surrogate";goto fail;}
-                    if(!cp) {p->err="embedded NUL unsupported at C-string boundary";goto fail;}
-                    append_codepoint(&b,cp);continue;
-                }
-                default:p->err="invalid escape";goto fail;
+        char e=p->s[p->pos]; if(!e) {p->err="incomplete escape";goto fail;} p->pos++;
+        switch(e) {
+            case '"': c='"';break; case '\\':c='\\';break;case '/':c='/';break;
+            case 'b':c='\b';break;case 'f':c='\f';break;case 'n':c='\n';break;case 'r':c='\r';break;case 't':c='\t';break;
+            case 'u': {
+                unsigned cp,lo;
+                if(!hex4(p,&cp)) {p->err="invalid Unicode escape";goto fail;}
+                if(cp>=0xd800 && cp<=0xdbff) {
+                    if(p->s[p->pos]!='\\' || p->s[p->pos+1]!='u') {p->err="missing low surrogate";goto fail;}
+                    p->pos+=2;
+                    if(!hex4(p,&lo) || lo<0xdc00 || lo>0xdfff) {p->err="invalid low surrogate";goto fail;}
+                    cp=0x10000+((cp-0xd800)<<10)+(lo-0xdc00);
+                } else if(cp>=0xdc00 && cp<=0xdfff) {p->err="unpaired surrogate";goto fail;}
+                if(!cp) {p->err="embedded NUL unsupported at C-string boundary";goto fail;}
+                append_codepoint(&b,cp);continue;
             }
+            default:p->err="invalid escape";goto fail;
         }
         char ch=(char)c;strbuf_append(&b,&ch,1);
     }
@@ -126,7 +128,7 @@ static JsonValue *number(Parser *p) {
 invalid:p->err="invalid number";return NULL;
 }
 static bool object_find(const JsonValue *v,const char *key,size_t *at) {
-    if(v->object.index) return strindex_get(v->object.index,key,at);
+    if(v->object.index.cap) return strindex_get(&v->object.index,key,at);
     for(size_t i=0;i<v->object.count;i++) if(str_eq(v->object.keys[i],key)) {if(at) *at=i;return true;}
     return false;
 }
@@ -144,12 +146,10 @@ static bool object_append(JsonValue *v,char *key,JsonValue *child) {
     if(!grow_slots((void **)&v->object.keys,&keys_cap,n,sizeof(*v->object.keys)) ||
        !grow_slots((void **)&v->object.values,&values_cap,n,sizeof(*v->object.values))) goto fail;
     v->object.cap=keys_cap;
-    if(!v->object.index && n>=JSON_INDEX_MIN) {
-        StrIndex *index=mem_calloc(1,sizeof(*index));if(!index) goto fail;strindex_init(index);
-        for(size_t i=0;i<v->object.count;i++) if(!strindex_put(index,v->object.keys[i],i)) {strindex_free(index);free(index);goto fail;}
-        v->object.index=index;
+    if(!v->object.index.cap && n>=JSON_INDEX_MIN) {
+        for(size_t i=0;i<v->object.count;i++) if(!strindex_put(&v->object.index,v->object.keys[i],i)) {strindex_free(&v->object.index);goto fail;}
     }
-    if(v->object.index && !strindex_put(v->object.index,key,n-1)) goto fail;
+    if(v->object.index.cap && !strindex_put(&v->object.index,key,n-1)) goto fail;
     v->object.keys[n-1]=key;v->object.values[n-1]=child;v->object.count=n;return true;
 fail:v->failed=true;free(key);json_free(child);return false;
 }
@@ -194,13 +194,14 @@ JsonValue *json_parse(const char *s,const char **err) {
     if(!v && err) *err=p.err?p.err:"allocation failure";return v;
 }
 void json_free(JsonValue *v) {
-    if(!v) return;free(v->number_text);
-    if(v->type==JSON_STRING) free(v->string);
-    else if(v->type==JSON_ARRAY) {for(size_t i=0;i<v->array.count;i++) json_free(v->array.items[i]);free(v->array.items);}
+    if(!v) return;
+    if(v->type==JSON_NUMBER) free(v->number_text);
+    else if(v->type==JSON_STRING) free(v->string);
+    else if(v->type==JSON_ARRAY) {for(size_t i=0;v->array.items && i<v->array.count;i++) json_free(v->array.items[i]);free(v->array.items);}
     else if(v->type==JSON_OBJECT) {
-        for(size_t i=0;i<v->object.count;i++) {free(v->object.keys[i]);json_free(v->object.values[i]);}
+        for(size_t i=0;v->object.keys && v->object.values && i<v->object.count;i++) {free(v->object.keys[i]);json_free(v->object.values[i]);}
         free(v->object.keys);free(v->object.values);
-        if(v->object.index) {strindex_free(v->object.index);free(v->object.index);}
+        strindex_free(&v->object.index);
     }free(v);
 }
 JsonValue *json_get(const JsonValue *v,const char *key) {
@@ -239,13 +240,52 @@ bool json_array_push(JsonValue *v,JsonValue *child) {
     v->array.items[n-1]=child;v->array.count=n;return true;
 fail:if(v) v->failed=true;if(child!=v) json_free(child);return false;
 }
+static JsonValue *clone_depth(const JsonValue *v,size_t depth) {
+    if(!v || v->failed || depth>ATTRACTOR_JSON_DEPTH) return NULL;
+    JsonValue *copy=alloc_value(v->type);if(!copy) return NULL;
+    switch(v->type) {
+        case JSON_NULL:break;
+        case JSON_BOOL:copy->boolean=v->boolean;break;
+        case JSON_NUMBER:
+            copy->number=v->number;
+            if(v->number_text && !(copy->number_text=str_dup(v->number_text))) {json_free(copy);return NULL;}
+            break;
+        case JSON_STRING:
+            copy->string=str_dup(v->string?v->string:"");
+            if(!copy->string) {json_free(copy);return NULL;}break;
+        case JSON_ARRAY:
+            if(v->array.count) {
+                copy->array.items=mem_calloc(v->array.count,sizeof(*copy->array.items));
+                if(!copy->array.items) {json_free(copy);return NULL;}
+                copy->array.cap=v->array.count;
+                for(size_t i=0;i<v->array.count;i++) {
+                    copy->array.items[i]=clone_depth(v->array.items[i],depth+1);
+                    if(!copy->array.items[i]) {copy->array.count=i;json_free(copy);return NULL;}
+                }
+                copy->array.count=v->array.count;
+            }break;
+        case JSON_OBJECT:
+            for(size_t i=0;i<v->object.count;i++) {
+                char *k=str_dup(v->object.keys[i]);if(!k) {json_free(copy);return NULL;}
+                JsonValue *c=clone_depth(v->object.values[i],depth+1);if(!c) {free(k);json_free(copy);return NULL;}
+                if(!object_append(copy,k,c)) {json_free(copy);return NULL;}
+            }break;
+    }
+    return copy;
+}
+JsonValue *json_clone(const JsonValue *v) {return clone_depth(v,0);}
 static void encode_string(const char *s,StrBuf *b) {
     strbuf_append_cstr(b,"\"");
-    for(const unsigned char *p=(const unsigned char *)s;p && *p;p++) {
-        switch(*p) {
+    const unsigned char *p=(const unsigned char *)s;
+    while(p && *p) {
+        const unsigned char *start=p;
+        while(*p>=32 && *p!='"' && *p!='\\') p++;
+        if(p>start) strbuf_append(b,(const char *)start,(size_t)(p-start));
+        if(!*p) break;
+        switch(*p++) {
             case '"':strbuf_append_cstr(b,"\\\"");break;case '\\':strbuf_append_cstr(b,"\\\\");break;
             case '\n':strbuf_append_cstr(b,"\\n");break;case '\r':strbuf_append_cstr(b,"\\r");break;case '\t':strbuf_append_cstr(b,"\\t");break;
-            default:if(*p<32) strbuf_appendf(b,"\\u%04x",(unsigned)*p);else strbuf_append(b,(const char *)p,1);
+            default:strbuf_appendf(b,"\\u%04x",(unsigned)p[-1]);break;
         }
     }strbuf_append_cstr(b,"\"");
 }

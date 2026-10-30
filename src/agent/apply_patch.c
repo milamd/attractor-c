@@ -255,33 +255,35 @@ static const char *apply_hunks(const char *raw, const Op *op, char **out) {
         if (n > longest) longest = n;
         c += n + (e ? 1 : 0);
     }
+    size_t max_old = 0;
     for (size_t h = 0; h < op->hunk_count; h++) {
         const Hunk *k = &op->hunks[h];
+        if (k->old_lines.count > max_old) max_old = k->old_lines.count;
         for (size_t i = 0; i < k->old_lines.count; i++) if (k->old_lines.items[i].n > longest) longest = k->old_lines.items[i].n;
         if (k->hint.n > longest) longest = k->hint.n;
     }
     const char *err = NULL;
     Scratch s = {mem_calloc(longest + 1, 1), mem_calloc(longest + 1, 1)};
     Edit *edits = mem_calloc(op->hunk_count ? op->hunk_count : 1, sizeof(*edits));
+    size_t *fail = max_old ? mem_calloc(max_old, sizeof(*fail)) : NULL;
     Seq text = {0};
-    if (!s.a || !s.b || !edits || !seq_init(&text, file.items, file.count, s.a)) { err = "Out of memory"; goto done; }
+    if (!s.a || !s.b || !edits || (max_old && !fail) || !seq_init(&text, file.items, file.count, s.a)) { err = "Out of memory"; goto done; }
 
     size_t cursor = 0;
     for (size_t h = 0; h < op->hunk_count && !err; h++) {
         const Hunk *k = &op->hunks[h];
         long hint_at = -1;
         if (k->has_hint) {
-            Seq hint = {0};
-            if (!seq_init(&hint, &k->hint, 1, s.a)) { err = "Out of memory"; break; }
+            uint64_t h_exact = fnv(k->hint.s, k->hint.n), h_norm = fnv(s.a, normalize(k->hint, s.a));
+            Seq hint = {.lines = &k->hint, .exact = &h_exact, .norm = &h_norm, .count = 1};
             for (size_t i = cursor; i < text.count && hint_at < 0; i++) if (lines_equal(&text, i, &hint, 0, true, &s)) hint_at = (long)i;
-            seq_free(&hint);
         }
         long at = -1;
         if (!k->old_lines.count) {
             at = k->eof || hint_at < 0 ? (long)text.count : hint_at + 1;
         } else {
-            Seq pat = {0}; size_t *fail = mem_calloc(k->old_lines.count, sizeof(size_t));
-            if (!fail || !seq_init(&pat, k->old_lines.items, k->old_lines.count, s.a)) { free(fail); seq_free(&pat); err = "Out of memory"; break; }
+            Seq pat = {0};
+            if (!seq_init(&pat, k->old_lines.items, k->old_lines.count, s.a)) { seq_free(&pat); err = "Out of memory"; break; }
             size_t starts[2] = {hint_at >= 0 ? (size_t)hint_at : cursor, cursor};
             for (int pass = 0; pass < 2 && at < 0; pass++) {
                 if (pass && starts[1] == starts[0]) break;
@@ -292,7 +294,7 @@ static const char *apply_hunks(const char *raw, const Op *op, char **out) {
                     } else at = kmp_find(&text, starts[pass], &pat, fuzzy, fail, &s);
                 }
             }
-            free(fail); seq_free(&pat);
+            seq_free(&pat);
             if (at < 0) { err = "A hunk's context or removed lines were not found in the file"; break; }
         }
         edits[h] = (Edit){(size_t)at, k->old_lines.count, &k->new_lines};
@@ -313,7 +315,7 @@ static const char *apply_hunks(const char *raw, const Op *op, char **out) {
         if (!*out) err = "Out of memory";
     }
 done:
-    seq_free(&text); free(edits); free(s.a); free(s.b); free(file.items);
+    seq_free(&text); free(fail); free(edits); free(s.a); free(s.b); free(file.items);
     return err;
 }
 

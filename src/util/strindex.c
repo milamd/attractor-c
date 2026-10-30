@@ -9,31 +9,34 @@ static size_t hash(const char *key) {
     return (size_t)h;
 }
 void strindex_init(StrIndex *ix) {*ix=(StrIndex){0};}
-void strindex_free(StrIndex *ix) {free(ix->keys);free(ix->values);strindex_init(ix);}
-static size_t slot(const StrIndex *ix,const char *key) {
-    size_t mask=ix->cap-1,i=hash(key)&mask;
-    while(ix->keys[i] && strcmp(ix->keys[i],key)) i=(i+1)&mask;
+void strindex_free(StrIndex *ix) {free(ix->slots);strindex_init(ix);}
+static size_t slot(const StrIndex *ix,const char *key,size_t h) {
+    size_t mask=ix->cap-1,i=h&mask;
+    while(ix->slots[i].key && (ix->slots[i].hash!=h || strcmp(ix->slots[i].key,key))) i=(i+1)&mask;
     return i;
 }
 static bool grow(StrIndex *ix) {
     size_t cap;if(!size_mul(ix->cap?ix->cap:8,2,&cap)) return false;
-    StrIndex next={.keys=mem_calloc(cap,sizeof(*next.keys)),.values=mem_calloc(cap,sizeof(*next.values)),.cap=cap};
-    if(!next.keys || !next.values) {free(next.keys);free(next.values);return false;}
-    for(size_t i=0;i<ix->cap;i++) if(ix->keys[i]) {
-        size_t j=slot(&next,ix->keys[i]);next.keys[j]=ix->keys[i];next.values[j]=ix->values[i];next.count++;
+    StrIndexSlot *slots=mem_calloc(cap,sizeof(*slots));
+    if(!slots) return false;
+    size_t mask=cap-1;
+    for(size_t i=0;i<ix->cap;i++) if(ix->slots[i].key) {
+        size_t j=ix->slots[i].hash&mask;
+        while(slots[j].key) j=(j+1)&mask;
+        slots[j]=ix->slots[i];
     }
-    strindex_free(ix);*ix=next;return true;
+    free(ix->slots);ix->slots=slots;ix->cap=cap;return true;
 }
 bool strindex_put(StrIndex *ix,const char *key,size_t value) {
     if(!key) return false;
     /* Keep load at or below one half so probes stay short. */
     if((ix->count+1)*2>ix->cap && !grow(ix)) return false;
-    size_t i=slot(ix,key);
-    if(!ix->keys[i]) {ix->keys[i]=key;ix->count++;}
-    ix->values[i]=value;return true;
+    size_t h=hash(key),i=slot(ix,key,h);
+    if(!ix->slots[i].key) {ix->slots[i].key=key;ix->slots[i].hash=h;ix->count++;}
+    ix->slots[i].value=value;return true;
 }
 bool strindex_get(const StrIndex *ix,const char *key,size_t *value) {
     if(!ix || !ix->cap || !key) return false;
-    size_t i=slot(ix,key);if(!ix->keys[i]) return false;
-    if(value) *value=ix->values[i];return true;
+    size_t h=hash(key),i=slot(ix,key,h);if(!ix->slots[i].key) return false;
+    if(value) *value=ix->slots[i].value;return true;
 }

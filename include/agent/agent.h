@@ -92,7 +92,7 @@ typedef struct {
 } RegisteredTool;
 
 typedef struct {
-    RegisteredTool **tools;
+    RegisteredTool  *tools;
     size_t           count;
     size_t           cap;
     bool             failed;
@@ -190,11 +190,13 @@ struct AgentSession {
     Message           **history;
     size_t              history_count;
     size_t              history_cap;
+    size_t              history_chars;
 
     /* Steering / follow-up queues */
     char              **steering_queue;
     size_t              steering_count;
     char              **followup_queue;
+    size_t              followup_head;
     size_t              followup_count;
 
     bool                abort_signaled;

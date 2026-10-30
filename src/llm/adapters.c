@@ -17,13 +17,13 @@
  * Shared adapter helpers
  *==========================================================================*/
 
-static char *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out, bool cache);
-static char *build_messages_json_openai(Message **msgs, size_t count, char **instructions_out);
-static char *build_messages_json_gemini(Message **msgs, size_t count, char **system_instruction_out);
-static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bool cache);
+static JsonValue *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out, bool cache);
+static JsonValue *build_messages_json_openai(Message **msgs, size_t count, char **instructions_out);
+static JsonValue *build_messages_json_gemini(Message **msgs, size_t count, char **system_instruction_out);
+static JsonValue *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bool cache);
 static JsonValue *ephemeral_cache(void);
-static char *build_tools_json_openai(ToolDefinition **tools, size_t count);
-static char *build_tools_json_gemini(ToolDefinition **tools, size_t count);
+static JsonValue *build_tools_json_openai(ToolDefinition **tools, size_t count);
+static JsonValue *build_tools_json_gemini(ToolDefinition **tools, size_t count);
 
 /* Parse Anthropic response JSON into LlmResponse */
 static LlmResponse *parse_anthropic_response(const char *json_str);
@@ -92,13 +92,6 @@ static void status_error(LlmError *err, const HttpResponse *resp, const char *pr
     }
 }
 
-static char *quoted(const char *text) {
-    JsonValue *value=json_new_string(text);char *encoded=json_serialize(value);json_free(value);return encoded;
-}
-static void append_number(StrBuf *buffer,const char *key,double number) {
-    JsonValue *value=json_new_number(number);char *encoded=json_serialize(value);json_free(value);
-    if(encoded) strbuf_appendf(buffer,"%s%s",key,encoded);else buffer->failed=true;free(encoded);
-}
 static char *url_component(const char *text) {
     StrBuf b;strbuf_init(&b);
     for(const unsigned char *p=(const unsigned char *)str_safe(text);*p;p++) {
@@ -203,7 +196,7 @@ static LlmResponse *anthropic_request(ProviderAdapter *self, const LlmRequest *r
 
     /* Build request body */
     char *system_prompt = NULL;
-    char *messages_json = build_messages_json_anthropic(req->messages, req->message_count, &system_prompt, cache);
+    JsonValue *messages_json = build_messages_json_anthropic(req->messages, req->message_count, &system_prompt, cache);
     /* Structured output has no native mode: json_schema forces a call to an
      * extraction tool whose input schema is the requested schema. */
     const ResponseFormat *rf = req->response_format;
@@ -213,12 +206,12 @@ static LlmResponse *anthropic_request(ProviderAdapter *self, const LlmRequest *r
     ToolDefinition **with_extractor = NULL;
     if (extract) {
         with_extractor = mem_calloc(req->tool_count + 1, sizeof(*with_extractor));
-        if (!with_extractor) { free(messages_json); free(system_prompt); strbuf_free(&beta); set_error(err,LLM_ERR_CONFIG,"Allocation failed","anthropic",0,false); return NULL; }
+        if (!with_extractor) { json_free(messages_json); free(system_prompt); strbuf_free(&beta); set_error(err,LLM_ERR_CONFIG,"Allocation failed","anthropic",0,false); return NULL; }
         for (size_t i = 0; i < req->tool_count; i++) with_extractor[i] = req->tools[i];
         with_extractor[req->tool_count] = &extractor;
         tool_list = with_extractor; tool_total = req->tool_count + 1;
     }
-    char *tools_json = tool_total > 0 && (extract || !(req->tool_choice && req->tool_choice->mode==TOOL_CHOICE_NONE))
+    JsonValue *tools_json = tool_total > 0 && (extract || !(req->tool_choice && req->tool_choice->mode==TOOL_CHOICE_NONE))
         ? build_tools_json_anthropic(tool_list, tool_total, cache)
         : NULL;
     free(with_extractor);
@@ -229,15 +222,11 @@ static LlmResponse *anthropic_request(ProviderAdapter *self, const LlmRequest *r
         free(system_prompt); system_prompt = strbuf_detach(&sys);
     }
 
-    StrBuf body;
-    strbuf_init(&body);
-    char *model_json=quoted(req->model);
-    if(!model_json) body.failed=true;
-    else strbuf_appendf(&body,"{\"model\":%s,\"max_tokens\":%d",model_json,req->max_tokens>0?req->max_tokens:4096);
-    free(model_json);
+    JsonValue *root = json_new_object();
+    json_object_set(root, "model", json_new_string(req->model));
+    json_object_set(root, "max_tokens", json_new_number(req->max_tokens > 0 ? req->max_tokens : 4096));
 
     if (system_prompt) {
-        /* Escape system prompt for JSON */
         JsonValue *sp = json_new_string(system_prompt);
         if (cache) {
             JsonValue *block = json_new_object();
@@ -247,40 +236,45 @@ static LlmResponse *anthropic_request(ProviderAdapter *self, const LlmRequest *r
             sp = json_new_array();
             json_array_push(sp, block);
         }
-        char *sp_json = json_serialize(sp);
-        strbuf_appendf(&body, ",\"system\":%s", sp_json);
-        free(sp_json);
-        json_free(sp);
+        json_object_set(root, "system", sp);
         free(system_prompt);
     }
 
-    strbuf_appendf(&body, ",\"messages\":%s", messages_json);
-    free(messages_json);
+    json_object_set(root, "messages", messages_json);
 
     if (tools_json) {
-        strbuf_appendf(&body, ",\"tools\":%s", tools_json);
-        if (extract) strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"tool\",\"name\":\"" ANTHROPIC_EXTRACTOR "\"}");
-        else if (req->tool_choice) {
+        json_object_set(root, "tools", tools_json);
+        if (extract) {
+            JsonValue *tc = json_new_object();
+            json_object_set(tc, "type", json_new_string("tool"));
+            json_object_set(tc, "name", json_new_string(ANTHROPIC_EXTRACTOR));
+            json_object_set(root, "tool_choice", tc);
+        } else if (req->tool_choice) {
+            JsonValue *tc = NULL;
             switch (req->tool_choice->mode) {
-                case TOOL_CHOICE_AUTO:     strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"auto\"}"); break;
-                case TOOL_CHOICE_REQUIRED: strbuf_append_cstr(&body, ",\"tool_choice\":{\"type\":\"any\"}"); break;
+                case TOOL_CHOICE_AUTO:
+                    tc = json_new_object();
+                    json_object_set(tc, "type", json_new_string("auto"));
+                    break;
+                case TOOL_CHOICE_REQUIRED:
+                    tc = json_new_object();
+                    json_object_set(tc, "type", json_new_string("any"));
+                    break;
                 case TOOL_CHOICE_NAMED:
-                    {char *name=quoted(req->tool_choice->tool_name);
-                    if(!name) body.failed=true;else strbuf_appendf(&body,",\"tool_choice\":{\"type\":\"tool\",\"name\":%s}",name);free(name);}
+                    tc = json_new_object();
+                    json_object_set(tc, "type", json_new_string("tool"));
+                    json_object_set(tc, "name", json_new_string(req->tool_choice->tool_name));
                     break;
                 case TOOL_CHOICE_NONE:
-                    /* Anthropic: omit tools entirely for "none" */
                     break;
             }
+            if (tc) json_object_set(root, "tool_choice", tc);
         }
-        free(tools_json);
     }
 
-    if (req->temperature >= 0) append_number(&body,",\"temperature\":",req->temperature);
-    if (req->top_p >= 0) append_number(&body,",\"top_p\":",req->top_p);
-    if (sink) strbuf_append_cstr(&body, ",\"stream\":true");
-
-    strbuf_append_cstr(&body, "}");
+    if (req->temperature >= 0) json_object_set(root, "temperature", json_new_number(req->temperature));
+    if (req->top_p >= 0) json_object_set(root, "top_p", json_new_number(req->top_p));
+    if (sink) json_object_set(root, "stream", json_new_bool(true));
 
     /* Build URL */
     StrBuf url;
@@ -297,24 +291,22 @@ static LlmResponse *anthropic_request(ProviderAdapter *self, const LlmRequest *r
         beta.len ? beta.data : NULL,
         NULL
     };
-    if (beta.failed) body.failed = true;
+    char *body_str = !beta.failed ? json_serialize(root) : NULL;
+    json_free(root);
 
     HttpRequest hreq = {
         .url = url.data,
         .method = "POST",
-        .body = body.data,
-        .body_len = body.len,
+        .body = body_str,
+        .body_len = body_str ? strlen(body_str) : 0,
         .headers = hdrs,
         .cancel=req->cancel, .timeout_ms = 120000
     };
 
-    JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
-    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
+    HttpResponse *resp=body_str && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
     mem_wipe(auth_hdr,sizeof(auth_hdr));
-    json_free(validated);
     strbuf_free(&url);
     strbuf_free(&beta);
-    char *body_str = strbuf_detach(&body);
     free(body_str);
 
     if (!resp) {
@@ -397,42 +389,38 @@ static LlmResponse *openai_request(ProviderAdapter *self, const LlmRequest *req,
 
 
     char *instructions = NULL;
-    char *input_json = build_messages_json_openai(req->messages, req->message_count, &instructions);
-    char *tools_json = req->tool_count > 0
+    JsonValue *input_json = build_messages_json_openai(req->messages, req->message_count, &instructions);
+    JsonValue *tools_json = req->tool_count > 0
         ? build_tools_json_openai(req->tools, req->tool_count)
         : NULL;
 
-    StrBuf body;
-    strbuf_init(&body);
-    char *model_json=quoted(req->model);
-    if(!model_json) body.failed=true;else strbuf_appendf(&body,"{\"model\":%s",model_json);
-    free(model_json);
+    JsonValue *root = json_new_object();
+    json_object_set(root, "model", json_new_string(req->model));
 
     if (instructions) {
-        JsonValue *ins = json_new_string(instructions);
-        char *ins_json = json_serialize(ins);
-        strbuf_appendf(&body, ",\"instructions\":%s", ins_json);
-        free(ins_json);
-        json_free(ins);
+        json_object_set(root, "instructions", json_new_string(instructions));
         free(instructions);
     }
 
-    strbuf_appendf(&body, ",\"input\":%s", input_json);
-    free(input_json);
+    json_object_set(root, "input", input_json);
 
-    if (tools_json) {
-        strbuf_appendf(&body, ",\"tools\":%s", tools_json);
-        free(tools_json);
-    }
+    if (tools_json)
+        json_object_set(root, "tools", tools_json);
 
     if(req->tool_choice) {
-        const char *choice=req->tool_choice->mode==TOOL_CHOICE_NONE?"none":req->tool_choice->mode==TOOL_CHOICE_REQUIRED?"required":"auto";
-        if(req->tool_choice->mode==TOOL_CHOICE_NAMED) {char *name=quoted(req->tool_choice->tool_name);if(!name) body.failed=true;else strbuf_appendf(&body,",\"tool_choice\":{\"type\":\"function\",\"name\":%s}",name);free(name);}
-        else strbuf_appendf(&body,",\"tool_choice\":\"%s\"",choice);
+        if(req->tool_choice->mode==TOOL_CHOICE_NAMED) {
+            JsonValue *tc = json_new_object();
+            json_object_set(tc, "type", json_new_string("function"));
+            json_object_set(tc, "name", json_new_string(req->tool_choice->tool_name));
+            json_object_set(root, "tool_choice", tc);
+        } else {
+            const char *choice=req->tool_choice->mode==TOOL_CHOICE_NONE?"none":req->tool_choice->mode==TOOL_CHOICE_REQUIRED?"required":"auto";
+            json_object_set(root, "tool_choice", json_new_string(choice));
+        }
     }
-    if(req->top_p>=0) append_number(&body,",\"top_p\":",req->top_p);
-    if (req->max_tokens > 0) strbuf_appendf(&body, ",\"max_output_tokens\":%d", req->max_tokens);
-    if (req->temperature >= 0) append_number(&body,",\"temperature\":",req->temperature);
+    if(req->top_p>=0) json_object_set(root, "top_p", json_new_number(req->top_p));
+    if (req->max_tokens > 0) json_object_set(root, "max_output_tokens", json_new_number(req->max_tokens));
+    if (req->temperature >= 0) json_object_set(root, "temperature", json_new_number(req->temperature));
 
     if (req->reasoning_effort != REASONING_NONE) {
         const char *effort = NULL;
@@ -442,20 +430,33 @@ static LlmResponse *openai_request(ProviderAdapter *self, const LlmRequest *req,
             case REASONING_HIGH:   effort = "high"; break;
             default: break;
         }
-        if (effort)
-            strbuf_appendf(&body, ",\"reasoning\":{\"effort\":\"%s\"}", effort);
+        if (effort) {
+            JsonValue *r_obj = json_new_object();
+            json_object_set(r_obj, "effort", json_new_string(effort));
+            json_object_set(root, "reasoning", r_obj);
+        }
     }
 
     /* Structured output: Responses API text.format (schema validated by the client). */
     const ResponseFormat *rf = req->response_format;
-    if (rf && str_eq(rf->type, "json_schema"))
-        strbuf_appendf(&body, ",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"output\",\"schema\":%s,\"strict\":%s}}",
-                       rf->json_schema, rf->strict ? "true" : "false");
-    else if (rf && str_eq(rf->type, "json"))
-        strbuf_append_cstr(&body, ",\"text\":{\"format\":{\"type\":\"json_object\"}}");
-    if (sink) strbuf_append_cstr(&body, ",\"stream\":true");
+    if (rf && str_eq(rf->type, "json_schema")) {
+        JsonValue *text_obj = json_new_object(), *fmt = json_new_object();
+        json_object_set(fmt, "type", json_new_string("json_schema"));
+        json_object_set(fmt, "name", json_new_string("output"));
+        json_object_set(fmt, "schema", json_parse(rf->json_schema, NULL));
+        json_object_set(fmt, "strict", json_new_bool(rf->strict));
+        json_object_set(text_obj, "format", fmt);
+        json_object_set(root, "text", text_obj);
+    } else if (rf && str_eq(rf->type, "json")) {
+        JsonValue *text_obj = json_new_object(), *fmt = json_new_object();
+        json_object_set(fmt, "type", json_new_string("json_object"));
+        json_object_set(text_obj, "format", fmt);
+        json_object_set(root, "text", text_obj);
+    }
+    if (sink) json_object_set(root, "stream", json_new_bool(true));
 
-    strbuf_append_cstr(&body, "}");
+    char *body_str = json_serialize(root);
+    json_free(root);
 
     StrBuf url;
     strbuf_init(&url);
@@ -467,17 +468,14 @@ static LlmResponse *openai_request(ProviderAdapter *self, const LlmRequest *req,
 
     HttpRequest hreq = {
         .url = url.data, .method = "POST",
-        .body = body.data, .body_len = body.len,
+        .body = body_str, .body_len = body_str ? strlen(body_str) : 0,
         .headers = hdrs, .cancel=req->cancel, .timeout_ms = 120000
     };
 
-    JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
-    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
+    HttpResponse *resp=body_str && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
     mem_wipe(auth_hdr,sizeof(auth_hdr));
-    json_free(validated);
     strbuf_free(&url);
-    char *body_cpy = strbuf_detach(&body);
-    free(body_cpy);
+    free(body_str);
 
     if (!resp) {
         transport_error(err, req, sink, "openai");
@@ -554,49 +552,43 @@ static LlmResponse *gemini_request(ProviderAdapter *self, const LlmRequest *req,
 
 
     char *system_instruction = NULL;
-    char *contents_json = build_messages_json_gemini(req->messages, req->message_count, &system_instruction);
-    char *tools_json = req->tool_count > 0
+    JsonValue *contents_json = build_messages_json_gemini(req->messages, req->message_count, &system_instruction);
+    JsonValue *tools_json = req->tool_count > 0
         ? build_tools_json_gemini(req->tools, req->tool_count)
         : NULL;
 
-    StrBuf body;
-    strbuf_init(&body);
-    strbuf_append_cstr(&body, "{\"contents\":");
-    strbuf_append_cstr(&body, contents_json);
-    free(contents_json);
+    JsonValue *root = json_new_object();
+    json_object_set(root, "contents", contents_json);
 
     if (system_instruction) {
-        JsonValue *si = json_new_string(system_instruction);
-        char *si_json = json_serialize(si);
-        strbuf_appendf(&body, ",\"systemInstruction\":{\"parts\":[{\"text\":%s}]}", si_json);
-        free(si_json);
-        json_free(si);
+        JsonValue *si = json_new_object(), *parts = json_new_array(), *part = json_new_object();
+        json_object_set(part, "text", json_new_string(system_instruction));
+        json_array_push(parts, part);
+        json_object_set(si, "parts", parts);
+        json_object_set(root, "systemInstruction", si);
         free(system_instruction);
     }
 
-    if (tools_json) {
-        strbuf_appendf(&body, ",\"tools\":%s", tools_json);
-        free(tools_json);
-    }
+    if (tools_json)
+        json_object_set(root, "tools", tools_json);
 
-    StrBuf gc;
-    strbuf_init(&gc);
-    strbuf_append_cstr(&gc, ",\"generationConfig\":{");
-    bool has_gc = false;
-    if (req->max_tokens > 0) { strbuf_appendf(&gc, "\"maxOutputTokens\":%d", req->max_tokens); has_gc = true; }
-    if (req->temperature >= 0) { if (has_gc) strbuf_append_cstr(&gc, ","); append_number(&gc,"\"temperature\":",req->temperature); has_gc = true; }
-    if(req->top_p>=0) {if(has_gc) strbuf_append_cstr(&gc,",");append_number(&gc,"\"topP\":",req->top_p);has_gc=true;}
     const ResponseFormat *rf = req->response_format;
-    if (rf && (str_eq(rf->type, "json") || str_eq(rf->type, "json_schema"))) {
-        strbuf_appendf(&gc, "%s\"responseMimeType\":\"application/json\"", has_gc ? "," : "");
-        if (str_eq(rf->type, "json_schema")) strbuf_appendf(&gc, ",\"responseSchema\":%s", rf->json_schema);
-        has_gc = true;
+    bool has_rf = rf && (str_eq(rf->type, "json") || str_eq(rf->type, "json_schema"));
+    if (req->max_tokens > 0 || req->temperature >= 0 || req->top_p >= 0 || has_rf) {
+        JsonValue *gc = json_new_object();
+        if (req->max_tokens > 0) json_object_set(gc, "maxOutputTokens", json_new_number(req->max_tokens));
+        if (req->temperature >= 0) json_object_set(gc, "temperature", json_new_number(req->temperature));
+        if (req->top_p >= 0) json_object_set(gc, "topP", json_new_number(req->top_p));
+        if (has_rf) {
+            json_object_set(gc, "responseMimeType", json_new_string("application/json"));
+            if (str_eq(rf->type, "json_schema"))
+                json_object_set(gc, "responseSchema", json_parse(rf->json_schema, NULL));
+        }
+        json_object_set(root, "generationConfig", gc);
     }
-    strbuf_append_cstr(&gc, "}");
-    if (has_gc) strbuf_append_cstr(&body, gc.data);
-    strbuf_free(&gc);
 
-    strbuf_append_cstr(&body, "}");
+    char *body_str = json_serialize(root);
+    json_free(root);
 
     StrBuf url;
     strbuf_init(&url);
@@ -609,17 +601,14 @@ static LlmResponse *gemini_request(ProviderAdapter *self, const LlmRequest *req,
     const char *hdrs[] = { "Content-Type: application/json", auth_hdr, NULL };
     HttpRequest hreq = {
         .url = url.data, .method = "POST",
-        .body = body.data, .body_len = body.len,
+        .body = body_str, .body_len = body_str ? strlen(body_str) : 0,
         .headers = hdrs, .cancel=req->cancel, .timeout_ms = 120000
     };
 
-    JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
-    HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
+    HttpResponse *resp=body_str && !url.failed && mem_failure_count()==request_failures?send_request(&hreq,sink):NULL;
     mem_wipe(auth_hdr,sizeof(auth_hdr));
-    json_free(validated);
     strbuf_free(&url);
-    char *body_cpy = strbuf_detach(&body);
-    free(body_cpy);
+    free(body_str);
 
     if (!resp) {
         transport_error(err, req, sink, "gemini");
@@ -681,7 +670,7 @@ ProviderAdapter *gemini_adapter_new(const char *api_key, const char *base_url) {
  *==========================================================================*/
 
 /* Build Anthropic messages JSON, extracting system messages */
-static char *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out, bool cache) {
+static JsonValue *build_messages_json_anthropic(Message **msgs, size_t count, char **system_out, bool cache) {
     StrBuf sys;
     strbuf_init(&sys);
     JsonValue *arr = json_new_array();
@@ -770,13 +759,11 @@ static char *build_messages_json_anthropic(Message **msgs, size_t count, char **
 
     *system_out = sys.len > 0 ? strbuf_detach(&sys) : NULL;
     if (sys.len == 0) strbuf_free(&sys);
-    char *result = json_serialize(arr);
-    json_free(arr);
-    return result;
+    return arr;
 }
 
 /* Build OpenAI Responses API input array */
-static char *build_messages_json_openai(Message **msgs, size_t count, char **instructions_out) {
+static JsonValue *build_messages_json_openai(Message **msgs, size_t count, char **instructions_out) {
     StrBuf instr;
     strbuf_init(&instr);
     JsonValue *arr = json_new_array();
@@ -822,9 +809,7 @@ static char *build_messages_json_openai(Message **msgs, size_t count, char **ins
 
     *instructions_out = instr.len > 0 ? strbuf_detach(&instr) : NULL;
     if (instr.len == 0) strbuf_free(&instr);
-    char *result = json_serialize(arr);
-    json_free(arr);
-    return result;
+    return arr;
 }
 
 static const char *tool_name_for_id(Message **messages,size_t count,const char *id) {
@@ -835,7 +820,7 @@ static const char *tool_name_for_id(Message **messages,size_t count,const char *
     return NULL;
 }
 /* Build Gemini contents JSON */
-static char *build_messages_json_gemini(Message **msgs, size_t count, char **system_instruction_out) {
+static JsonValue *build_messages_json_gemini(Message **msgs, size_t count, char **system_instruction_out) {
     StrBuf sys;
     strbuf_init(&sys);
     JsonValue *arr = json_new_array();
@@ -901,9 +886,7 @@ static char *build_messages_json_gemini(Message **msgs, size_t count, char **sys
 
     *system_instruction_out = sys.len > 0 ? strbuf_detach(&sys) : NULL;
     if (sys.len == 0) strbuf_free(&sys);
-    char *result = json_serialize(arr);
-    json_free(arr);
-    return result;
+    return arr;
 }
 
 /* Build Anthropic tools JSON */
@@ -913,7 +896,7 @@ static JsonValue *ephemeral_cache(void) {
     return c;
 }
 
-static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bool cache) {
+static JsonValue *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bool cache) {
     JsonValue *arr = json_new_array();
     for (size_t i = 0; i < count; i++) {
         JsonValue *t = json_new_object();
@@ -928,13 +911,11 @@ static char *build_tools_json_anthropic(ToolDefinition **tools, size_t count, bo
         if (cache && i + 1 == count) json_object_set(t, "cache_control", ephemeral_cache());
         json_array_push(arr, t);
     }
-    char *result = json_serialize(arr);
-    json_free(arr);
-    return result;
+    return arr;
 }
 
 /* Build OpenAI tools JSON (Responses API format: flat, not nested under "function") */
-static char *build_tools_json_openai(ToolDefinition **tools, size_t count) {
+static JsonValue *build_tools_json_openai(ToolDefinition **tools, size_t count) {
     JsonValue *arr = json_new_array();
     for (size_t i = 0; i < count; i++) {
         JsonValue *t = json_new_object();
@@ -948,13 +929,11 @@ static char *build_tools_json_openai(ToolDefinition **tools, size_t count) {
         }
         json_array_push(arr, t);
     }
-    char *result = json_serialize(arr);
-    json_free(arr);
-    return result;
+    return arr;
 }
 
 /* Build Gemini tools JSON */
-static char *build_tools_json_gemini(ToolDefinition **tools, size_t count) {
+static JsonValue *build_tools_json_gemini(ToolDefinition **tools, size_t count) {
     JsonValue *arr = json_new_array();
     JsonValue *decls_obj = json_new_object();
     JsonValue *decls = json_new_array();
@@ -971,9 +950,7 @@ static char *build_tools_json_gemini(ToolDefinition **tools, size_t count) {
     }
     json_object_set(decls_obj, "functionDeclarations", decls);
     json_array_push(arr, decls_obj);
-    char *result = json_serialize(arr);
-    json_free(arr);
-    return result;
+    return arr;
 }
 
 /*============================================================================
