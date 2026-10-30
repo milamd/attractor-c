@@ -825,7 +825,7 @@ static void submit_one(AgentSession *s, const char *input) {
             emit(s, AGENT_EVT_TOOL_CALL_END, result_str, tc->name, tc->id);
 
             if(strlen(result_str)>50000) {
-                char *shortened=str_ndup(result_str,50000);free(result_str);result_str=shortened;
+                char *shortened=str_ndup(result_str,str_utf8_prefix(result_str,50000));free(result_str);result_str=shortened;
                 if(!result_str) {s->failed=true;break;}
             }
 

@@ -69,6 +69,7 @@ typedef struct {
     char   *default_fidelity;
     char   *default_model;
     char   *default_provider;
+    struct StrIndex *node_index; /* id -> node position; owned, NULL for hand-built graphs */
 } DotGraph;
 
 /* Parse a DOT source string. Returns NULL on error, sets *err_msg. */
@@ -82,6 +83,11 @@ const char *dot_node_role(const DotNode *node);
 const DotNode *dot_parallel_join(const DotGraph *graph, const DotNode *fork, char **error);
 /* Find nodes/edges */
 DotNode    *dot_find_node(const DotGraph *g, const char *id);
+/* Outgoing adjacency in edge order: edges of node i are edge[offset[i]..offset[i+1]),
+ * and target[k] is the node position of edge[k]'s head or SIZE_MAX when unknown. */
+typedef struct {size_t *offset, *edge, *target;} DotAdjacency;
+bool        dot_adjacency_build(const DotGraph *g, DotAdjacency *adjacency);
+void        dot_adjacency_free(DotAdjacency *adjacency);
 /* Return total matching edges, write at most max. NULL/0 counts only; callers
  * must compare the return to capacity before accessing the output array. */
 size_t      dot_outgoing_edges(const DotGraph *g, const char *node_id,

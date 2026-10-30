@@ -28,3 +28,6 @@ void *mem_reallocarray(void *old,size_t count,size_t size) {
     size_t bytes; if(!size_mul(count,size,&bytes)) {failures++;errno=ENOMEM;return NULL;}
     if(!allowed()) return NULL;void *p=realloc(old,bytes?bytes:1);if(!p) failures++;return p;
 }
+void mem_wipe(void *p,size_t size) {
+    volatile unsigned char *bytes=p;while(bytes && size--) *bytes++=0;
+}

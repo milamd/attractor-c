@@ -583,8 +583,63 @@ static void filesystem_permissions(void) {
     const DotEdge *edges[1];DotGraph *graph=dot_parse("digraph G { a -> b; a -> c; }",NULL);assert(dot_outgoing_edges(graph,"a",edges,1)==2 && dot_outgoing_edges(graph,"a",NULL,0)==2);dot_graph_free(graph);
 }
 
+static void json_scaling(void) {
+    /* Quadratic duplicate-key scans or one-slot growth exceed the case deadline. */
+    StrBuf b;strbuf_init(&b);strbuf_append_cstr(&b,"{");
+    for(size_t i=0;i<200000;i++) strbuf_appendf(&b,"%s\"k%zu\":%zu",i?",":"",i,i);
+    strbuf_append_cstr(&b,"}");char *object=strbuf_detach(&b);assert(object);
+    JsonValue *v=json_parse(object,NULL);assert(v && v->object.count==200000 && json_get_int(v,"k199999",-1)==199999);json_free(v);
+    object[strlen(object)-1]=0;StrBuf dup;strbuf_init(&dup);strbuf_appendf(&dup,"%s,\"k0\":1}",object);free(object);
+    char *duplicate=strbuf_detach(&dup);const char *err=NULL;assert(!json_parse(duplicate,&err) && str_eq(err,"duplicate key"));free(duplicate);
+    strbuf_init(&b);strbuf_append_cstr(&b,"[");for(size_t i=0;i<1000000;i++) strbuf_append_cstr(&b,i?",0.5":"0.5");strbuf_append_cstr(&b,"]");
+    char *array=strbuf_detach(&b);v=json_parse(array,NULL);free(array);assert(v && v->array.count==1000000);
+    char *encoded=json_serialize(v);assert(encoded);free(encoded);json_free(v);
+    JsonValue *built=json_new_object();for(size_t i=0;i<50000;i++) {char key[32];snprintf(key,sizeof(key),"b%zu",i);assert(json_object_set(built,key,json_new_number(1)));}
+    assert(json_object_set(built,"b7",json_new_number(2)) && built->object.count==50000 && json_get_int(built,"b7",0)==2);json_free(built);
+}
+static void dot_scaling(void) {
+    StrBuf b;strbuf_init(&b);strbuf_append_cstr(&b,"digraph G { start [shape=Mdiamond]; exit [shape=Msquare]; start -> n0;");
+    for(size_t i=0;i+1<9000;i++) for(size_t k=1;k<=10 && i+k<9000;k++) strbuf_appendf(&b," n%zu -> n%zu;",i,i+k);
+    strbuf_append_cstr(&b," n8999 -> exit; }");char *source=strbuf_detach(&b);assert(source);
+    char *err=NULL;DotGraph *g=dot_parse(source,&err);free(source);assert(g && !err && g->node_count==9002 && g->edge_count==89947);
+    struct timespec began,ended;clock_gettime(CLOCK_MONOTONIC,&began);
+    assert(validate_or_raise(g,NULL));assert(str_eq(dot_find_node(g,"n4500")->id,"n4500"));
+    char *join_err=NULL;DotNode *fork=dot_find_node(g,"n0");assert(!dot_parallel_join(g,fork,&join_err));free(join_err);
+    clock_gettime(CLOCK_MONOTONIC,&ended);assert(ended.tv_sec-began.tv_sec<2);dot_graph_free(g);
+    /* Repeated node statements must not multiply scoped default attributes. */
+    strbuf_init(&b);strbuf_append_cstr(&b,"digraph G { node [");
+    for(size_t i=0;i<200;i++) strbuf_appendf(&b,"%sd%zu=v",i?",":"",i);
+    strbuf_append_cstr(&b,"]; x [label=one];");for(size_t i=0;i<5000;i++) strbuf_append_cstr(&b," x;");
+    strbuf_append_cstr(&b," x [label=two]; }");source=strbuf_detach(&b);assert(source);
+    g=dot_parse(source,&err);free(source);assert(g && !err);
+    DotNode *x=dot_find_node(g,"x");assert(x && x->attr_count==201 && str_eq(x->label,"two") && str_eq(dot_node_attr(x,"label",NULL),"two"));dot_graph_free(g);
+    strbuf_init(&b);strbuf_append_cstr(&b,"digraph G { x [");for(size_t i=0;i<5000;i++) strbuf_appendf(&b,"%sa%zu=v",i?",":"",i);
+    strbuf_append_cstr(&b,"]; }");source=strbuf_detach(&b);g=dot_parse(source,&err);free(source);assert(!g && err);free(err);
+}
+static bool utf8_ok(const char *s) {JsonValue *v=json_new_string(s);bool ok=v!=NULL;json_free(v);return ok;}
+static void utf8_truncation(void) {
+    const char *s="a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80"; /* a, e-acute, euro, emoji */
+    assert(str_utf8_prefix(s,0)==0 && str_utf8_prefix(s,1)==1 && str_utf8_prefix(s,2)==1 && str_utf8_prefix(s,3)==3);
+    assert(str_utf8_prefix(s,5)==3 && str_utf8_prefix(s,6)==6 && str_utf8_prefix(s,9)==6 && str_utf8_prefix(s,10)==10 && str_utf8_prefix(s,99)==10);
+    StrBuf b;strbuf_init(&b);for(size_t i=0;i<300;i++) strbuf_append_cstr(&b,"\xe2\x82\xac");strbuf_append_cstr(&b,"x");char *value=strbuf_detach(&b);
+    PipelineContext c;ctx_init(&c);ctx_set(&c,"k",value);free(value);
+    const char *modes[]={"truncate","compact"};
+    for(size_t i=0;i<2;i++) {char *text=ctx_to_preamble(&c,modes[i]);assert(text && utf8_ok(text));free(text);}
+    ctx_free(&c);
+}
+static void base_url_policy(void) {
+    const char *rejected[]={"http://example.com","http://127.0.0.1.example.com","ftp://127.0.0.1","example.com","http://localhost@evil.test"};
+    for(size_t i=0;i<sizeof(rejected)/sizeof(*rejected);i++) assert(!anthropic_adapter_new("k",rejected[i]) && !openai_adapter_new("k",rejected[i]) && !gemini_adapter_new("k",rejected[i]));
+    const char *accepted[]={"https://api.example.com","http://127.0.0.1:8080","http://localhost","http://[::1]:9/"};
+    for(size_t i=0;i<sizeof(accepted)/sizeof(*accepted);i++) {
+        ProviderAdapter *a=openai_adapter_new("k",accepted[i]);assert(a);a->close(a);free(a->impl);free(a->name);free(a);
+    }
+}
+
 typedef struct {const char *name; void (*run)(void); bool expected_failure;} Case;
 static const Case cases[] = {
+    {"JSON large containers",json_scaling,false}, {"DOT large graphs / attribute bounds",dot_scaling,false},
+    {"UTF-8 safe truncation",utf8_truncation,false}, {"provider base URL transport policy",base_url_policy,false},
     {"checkpoint validation / allocation / ambiguity",checkpoint_validation,false}, {"human timeout policy",human_timeout,false}, {"artifact permissions / names / I/O errors",filesystem_permissions,false},
     {"branch committed recovery / new run",branch_recovery,false}, {"nested forks / join policies / cancellation",nested_and_policies,false}, {"session / provider construction failures",construction_failures,false},
     {"local HTTP transport / provider contracts",local_transport,false}, {"bounded parser fuzz",bounded_fuzz,false}, {"human EOF / invalid / cancellation",human_input,false}, {"partial / skipped / retry / large routing",outcome_routes,false}, {"recursive search containment",search_containment,false},

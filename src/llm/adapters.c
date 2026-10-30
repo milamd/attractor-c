@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 
 /*============================================================================
@@ -69,6 +70,21 @@ static char *url_component(const char *text) {
         else strbuf_appendf(&b,"%%%02X",(unsigned)*p);
     }return strbuf_detach(&b);
 }
+
+/* Credentials travel in request headers, so require TLS except for loopback
+ * hosts used by local proxies and test fixtures. */
+static bool base_url_allowed(const char *url) {
+    if(!url) return true;
+    if(!strncasecmp(url,"https://",8)) return url[8]!=0;
+    if(strncasecmp(url,"http://",7)) return false;
+    const char *host=url+7,*loopback[]={"127.0.0.1","localhost","[::1]"};
+    for(size_t i=0;i<sizeof(loopback)/sizeof(*loopback);i++) {
+        size_t n=strlen(loopback[i]);
+        if(!strncasecmp(host,loopback[i],n) && (!host[n] || host[n]==':' || host[n]=='/')) return true;
+    }
+    return false;
+}
+static void free_secret(char *secret) {if(secret) {mem_wipe(secret,strlen(secret));free(secret);}}
 
 /*============================================================================
  * Anthropic Adapter
@@ -165,6 +181,7 @@ static LlmResponse *anthropic_complete(ProviderAdapter *self, const LlmRequest *
 
     JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
     HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    mem_wipe(auth_hdr,sizeof(auth_hdr));
     json_free(validated);
     strbuf_free(&url);
     char *body_str = strbuf_detach(&body);
@@ -208,11 +225,11 @@ static int anthropic_stream(ProviderAdapter *self, const LlmRequest *req,
 
 static void anthropic_close(ProviderAdapter *self) {
     AnthropicState *st=self->impl;
-    if(st) {free(st->api_key);free(st->base_url);}
+    if(st) {free_secret(st->api_key);free(st->base_url);}
 }
 
 ProviderAdapter *anthropic_adapter_new(const char *api_key, const char *base_url) {
-    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n')) return NULL;
+    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n') || !base_url_allowed(base_url)) return NULL;
     ProviderAdapter *a = mem_calloc(1, sizeof(ProviderAdapter));
     if(!a) return NULL;
     a->name = str_dup("anthropic");
@@ -314,6 +331,7 @@ static LlmResponse *openai_complete(ProviderAdapter *self, const LlmRequest *req
 
     JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
     HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    mem_wipe(auth_hdr,sizeof(auth_hdr));
     json_free(validated);
     strbuf_free(&url);
     char *body_cpy = strbuf_detach(&body);
@@ -357,11 +375,11 @@ static int openai_stream(ProviderAdapter *self, const LlmRequest *req,
 
 static void openai_close(ProviderAdapter *self) {
     OpenAIState *st=self->impl;
-    if(st) {free(st->api_key);free(st->base_url);}
+    if(st) {free_secret(st->api_key);free(st->base_url);}
 }
 
 ProviderAdapter *openai_adapter_new(const char *api_key, const char *base_url) {
-    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n')) return NULL;
+    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n') || !base_url_allowed(base_url)) return NULL;
     ProviderAdapter *a = mem_calloc(1, sizeof(ProviderAdapter));
     if(!a) return NULL;
     a->name = str_dup("openai");
@@ -452,6 +470,7 @@ static LlmResponse *gemini_complete(ProviderAdapter *self, const LlmRequest *req
 
     JsonValue *validated=body.data && !body.failed?json_parse(body.data,NULL):NULL;
     HttpResponse *resp=validated && !url.failed && mem_failure_count()==request_failures?http_request(&hreq):NULL;
+    mem_wipe(auth_hdr,sizeof(auth_hdr));
     json_free(validated);
     strbuf_free(&url);
     char *body_cpy = strbuf_detach(&body);
@@ -495,11 +514,11 @@ static int gemini_stream(ProviderAdapter *self, const LlmRequest *req,
 
 static void gemini_close(ProviderAdapter *self) {
     GeminiState *st=self->impl;
-    if(st) {free(st->api_key);free(st->base_url);}
+    if(st) {free_secret(st->api_key);free(st->base_url);}
 }
 
 ProviderAdapter *gemini_adapter_new(const char *api_key, const char *base_url) {
-    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n')) return NULL;
+    if(!api_key || !*api_key || strlen(api_key)>400 || strchr(api_key,'\r') || strchr(api_key,'\n') || !base_url_allowed(base_url)) return NULL;
     ProviderAdapter *a = mem_calloc(1, sizeof(ProviderAdapter));
     if(!a) return NULL;
     a->name = str_dup("gemini");

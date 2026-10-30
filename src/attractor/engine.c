@@ -229,8 +229,11 @@ char *ctx_to_preamble(const PipelineContext *ctx, const char *fidelity)
             const char *val = ctx->values[i];
             size_t vlen = val ? strlen(val) : 0;
             if (vlen > 200) {
+                /* Start the tail on a UTF-8 sequence boundary. */
+                const char *tail = val + vlen - 200;
+                while (*tail && ((unsigned char)*tail & 0xc0) == 0x80) tail++;
                 strbuf_appendf(&sb, "- **%s**: ...%s\n",
-                               ctx->keys[i], val + vlen - 200);
+                               ctx->keys[i], tail);
             } else {
                 strbuf_appendf(&sb, "- **%s**: %s\n",
                                ctx->keys[i], val ? val : "");
@@ -250,7 +253,8 @@ char *ctx_to_preamble(const PipelineContext *ctx, const char *fidelity)
             const char *val = ctx->values[i];
             size_t vlen = val ? strlen(val) : 0;
             if (vlen > 80) {
-                strbuf_appendf(&sb, "%s=%.77s...\n", ctx->keys[i], val);
+                strbuf_appendf(&sb, "%s=%.*s...\n", ctx->keys[i],
+                               (int)str_utf8_prefix(val, 77), val);
             } else {
                 strbuf_appendf(&sb, "%s=%s\n", ctx->keys[i], val ? val : "");
             }
@@ -322,12 +326,20 @@ bool checkpoint_save(const Checkpoint *cp,const char *path) {
     json_object_set(j,"graph_identity",json_new_string(cp->graph_identity));json_object_set(j,"run_id",json_new_string(cp->run_id));
     json_object_set(j,"next_node",json_new_string(str_safe(cp->next_node)));json_object_set(j,"pending_node",json_new_string(str_safe(cp->pending_node)));
     json_object_set(j,"complete",json_new_bool(cp->complete));json_object_set(j,"final_outcome",outcome_json(&cp->final_outcome));
-    json_object_set(j,"history",json_copy(cp->history));json_object_set(j,"latest",json_copy(cp->latest));
     JsonValue *context=json_new_object(),*logs=json_new_array();
     for(size_t i=0;i<cp->context.count;i++) json_object_set(context,cp->context.keys[i],json_new_string(cp->context.values[i]));
     for(size_t i=0;i<cp->context.log_count;i++) json_array_push(logs,json_new_string(cp->context.logs[i]));
     json_object_set(j,"context",context);json_object_set(j,"logs",logs);
-    char *encoded=json_serialize(j);json_free(j);if(!encoded) return false;
+    /* Splice the growing history/latest in serialized form instead of deep-copying
+     * them (a full serialize + parse) on every save. */
+    char *head=json_serialize(j),*history=json_serialize(cp->history),*latest=json_serialize(cp->latest);json_free(j);
+    StrBuf b;strbuf_init(&b);
+    if(head && history && latest) {
+        strbuf_append(&b,head,strlen(head)-1);
+        strbuf_appendf(&b,",\"history\":%s,\"latest\":%s}",history,latest);
+    } else b.failed=true;
+    free(head);free(history);free(latest);
+    char *encoded=strbuf_detach(&b);if(!encoded) return false;
     bool ok=io_atomic_write(path,encoded,IO_SYNC);free(encoded);return ok;
 }
 bool checkpoint_load(Checkpoint *cp,const char *path) {
@@ -620,7 +632,7 @@ static Outcome codergen_handler(const DotNode *node, PipelineContext *ctx,
 
     size_t resp_len = strlen(response);
     if (resp_len > 16384)
-        o.update_values[1] = str_ndup(response, 16384);
+        o.update_values[1] = str_ndup(response, str_utf8_prefix(response, 16384));
     else
         o.update_values[1] = str_dup(response);
 
@@ -632,7 +644,7 @@ static Outcome codergen_handler(const DotNode *node, PipelineContext *ctx,
         o.update_keys[2] = strbuf_detach(&rk);
     }
     if (resp_len > 65536)
-        o.update_values[2] = str_ndup(response, 65536);
+        o.update_values[2] = str_ndup(response, str_utf8_prefix(response, 65536));
     else
         o.update_values[2] = str_dup(response);
 

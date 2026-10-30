@@ -2,6 +2,7 @@
 #include "util/str.h"
 #include "util/mem.h"
 #include "util/io.h"
+#include "util/strindex.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -10,12 +11,21 @@
 #include <limits.h>
 #include <errno.h>
 #include <locale.h>
+#include <pthread.h>
 #ifdef __APPLE__
 #include <xlocale.h>
 #endif
 #ifndef ATTRACTOR_JSON_DEPTH
 #define ATTRACTOR_JSON_DEPTH 64u
 #endif
+#define JSON_INDEX_MIN 16u
+
+/* One immutable "C" numeric locale for the process; creating one per number
+ * dominated parse and serialize time. */
+static pthread_once_t c_locale_once=PTHREAD_ONCE_INIT;
+static locale_t c_locale;
+static void c_locale_init(void) {c_locale=newlocale(LC_NUMERIC_MASK,"C",NULL);}
+static locale_t numeric_locale(void) {pthread_once(&c_locale_once,c_locale_init);return c_locale;}
 
 typedef struct {const char *s; size_t pos,depth; const char *err;} Parser;
 static void ws(Parser *p) {while(p->s[p->pos] && strchr(" \r\n\t",p->s[p->pos])) p->pos++;}
@@ -108,12 +118,40 @@ static JsonValue *number(Parser *p) {
         while(isdigit((unsigned char)p->s[p->pos])) p->pos++;
     }
     char *lexeme=str_ndup(p->s+begin,p->pos-begin);if(!lexeme) return NULL;
-    locale_t loc=newlocale(LC_NUMERIC_MASK,"C",NULL);if(!loc) {free(lexeme);return NULL;}
-    errno=0;double n=strtod_l(lexeme,NULL,loc);freelocale(loc);
+    locale_t loc=numeric_locale();if(!loc) {free(lexeme);return NULL;}
+    errno=0;double n=strtod_l(lexeme,NULL,loc);
     if(!isfinite(n) || errno==ERANGE) {free(lexeme);p->err="number out of range";return NULL;}
     JsonValue *v=alloc_value(JSON_NUMBER);if(!v) {free(lexeme);return NULL;}
     v->number=n;v->number_text=lexeme;return v;
 invalid:p->err="invalid number";return NULL;
+}
+static bool object_find(const JsonValue *v,const char *key,size_t *at) {
+    if(v->object.index) return strindex_get(v->object.index,key,at);
+    for(size_t i=0;i<v->object.count;i++) if(str_eq(v->object.keys[i],key)) {if(at) *at=i;return true;}
+    return false;
+}
+static bool grow_slots(void **slots,size_t *cap,size_t need,size_t size) {
+    if(need<=*cap) return true;
+    size_t next=*cap?*cap:4;while(next<need) if(!size_mul(next,2,&next)) return false;
+    void *grown=mem_reallocarray(*slots,next,size);if(!grown) return false;
+    *slots=grown;*cap=next;return true;
+}
+/* Appends a key known to be absent. Consumes key and child on success and failure. */
+static bool object_append(JsonValue *v,char *key,JsonValue *child) {
+    size_t n,keys_cap=v->object.cap,values_cap=v->object.cap;
+    if(!size_add(v->object.count,1,&n)) goto fail;
+    /* If only keys grow, their extra capacity is unused until the next append. */
+    if(!grow_slots((void **)&v->object.keys,&keys_cap,n,sizeof(*v->object.keys)) ||
+       !grow_slots((void **)&v->object.values,&values_cap,n,sizeof(*v->object.values))) goto fail;
+    v->object.cap=keys_cap;
+    if(!v->object.index && n>=JSON_INDEX_MIN) {
+        StrIndex *index=mem_calloc(1,sizeof(*index));if(!index) goto fail;strindex_init(index);
+        for(size_t i=0;i<v->object.count;i++) if(!strindex_put(index,v->object.keys[i],i)) {strindex_free(index);free(index);goto fail;}
+        v->object.index=index;
+    }
+    if(v->object.index && !strindex_put(v->object.index,key,n-1)) goto fail;
+    v->object.keys[n-1]=key;v->object.values[n-1]=child;v->object.count=n;return true;
+fail:v->failed=true;free(key);json_free(child);return false;
 }
 static JsonValue *container(Parser *p,bool object) {
     if(p->depth>=ATTRACTOR_JSON_DEPTH) {p->err="nesting limit";return NULL;}
@@ -123,11 +161,11 @@ static JsonValue *container(Parser *p,bool object) {
         ws(p);char *key=NULL;
         if(object) {
             key=string_raw(p);if(!key) goto fail;
-            if(json_get(v,key)) {free(key);p->err="duplicate key";goto fail;}
+            if(object_find(v,key,NULL)) {free(key);p->err="duplicate key";goto fail;}
             ws(p);if(p->s[p->pos]!=':') {free(key);p->err="expected colon";goto fail;}p->pos++;
         }
         JsonValue *child=value(p);if(!child) {free(key);goto fail;}
-        bool ok=object?json_object_set(v,key,child):json_array_push(v,child);free(key);
+        bool ok=object?object_append(v,key,child):json_array_push(v,child);
         if(!ok) {p->err="allocation/size limit";goto fail;}
         ws(p);if(p->s[p->pos]==close) {p->pos++;break;}
         if(p->s[p->pos]!=',') {p->err="expected comma or closing delimiter";goto fail;}p->pos++;
@@ -162,11 +200,12 @@ void json_free(JsonValue *v) {
     else if(v->type==JSON_OBJECT) {
         for(size_t i=0;i<v->object.count;i++) {free(v->object.keys[i]);json_free(v->object.values[i]);}
         free(v->object.keys);free(v->object.values);
+        if(v->object.index) {strindex_free(v->object.index);free(v->object.index);}
     }free(v);
 }
 JsonValue *json_get(const JsonValue *v,const char *key) {
     if(!v || v->type!=JSON_OBJECT || !key) return NULL;
-    for(size_t i=0;i<v->object.count;i++) if(str_eq(v->object.keys[i],key)) return v->object.values[i];return NULL;
+    size_t i;return object_find(v,key,&i)?v->object.values[i]:NULL;
 }
 const char *json_get_string(const JsonValue *v,const char *k) {JsonValue *c=json_get(v,k);return c && c->type==JSON_STRING?c->string:NULL;}
 double json_get_number(const JsonValue *v,const char *k,double def) {JsonValue *c=json_get(v,k);return c && c->type==JSON_NUMBER?c->number:def;}
@@ -187,22 +226,17 @@ JsonValue *json_new_number(double n) {if(!isfinite(n)) return NULL;JsonValue *v=
 JsonValue *json_new_bool(bool b) {JsonValue *v=alloc_value(JSON_BOOL);if(v) v->boolean=b;return v;}
 bool json_object_set(JsonValue *v,const char *key,JsonValue *child) {
     if(!v || v->type!=JSON_OBJECT || !key || !child || child==v || child->failed) goto fail;
-    for(size_t i=0;i<v->object.count;i++) if(str_eq(v->object.keys[i],key)) {
+    size_t i;if(object_find(v,key,&i)) {
         if(v->object.values[i]!=child) {json_free(v->object.values[i]);v->object.values[i]=child;}return true;
     }
-    size_t n;if(!size_add(v->object.count,1,&n)) goto fail;
     char *owned=str_dup(key);if(!owned) goto fail;
-    char **keys=mem_reallocarray(v->object.keys,n,sizeof(*keys));
-    if(!keys) {free(owned);goto fail;}v->object.keys=keys;
-    JsonValue **values=mem_reallocarray(v->object.values,n,sizeof(*values));
-    if(!values) {free(owned);goto fail;}v->object.values=values;
-    keys[n-1]=owned;values[n-1]=child;v->object.count=n;return true;
+    return object_append(v,owned,child);
 fail:if(v) v->failed=true;if(child!=v) json_free(child);return false;
 }
 bool json_array_push(JsonValue *v,JsonValue *child) {
     size_t n;if(!v || v->type!=JSON_ARRAY || !child || child==v || child->failed || !size_add(v->array.count,1,&n)) goto fail;
-    JsonValue **items=mem_reallocarray(v->array.items,n,sizeof(*items));if(!items) goto fail;
-    v->array.items=items;items[n-1]=child;v->array.count=n;return true;
+    if(!grow_slots((void **)&v->array.items,&v->array.cap,n,sizeof(*v->array.items))) goto fail;
+    v->array.items[n-1]=child;v->array.count=n;return true;
 fail:if(v) v->failed=true;if(child!=v) json_free(child);return false;
 }
 static void encode_string(const char *s,StrBuf *b) {
@@ -234,7 +268,7 @@ static void serialize(const JsonValue *v,StrBuf *b,size_t depth) {
     }
 }
 char *json_serialize(const JsonValue *v) {
-    locale_t loc=newlocale(LC_NUMERIC_MASK,"C",NULL);if(!loc) return NULL;
+    locale_t loc=numeric_locale();if(!loc) return NULL;
     locale_t old=uselocale(loc);StrBuf b;strbuf_init(&b);serialize(v,&b,0);
-    uselocale(old);freelocale(loc);return strbuf_detach(&b);
+    uselocale(old);return strbuf_detach(&b);
 }
