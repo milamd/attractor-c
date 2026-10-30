@@ -3,6 +3,7 @@
 #include "util/str.h"
 #include "util/mem.h"
 #include <stdlib.h>
+#include <stdint.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
@@ -149,7 +150,8 @@ static void rule_reachability(const DotGraph *g, DiagnosticList *dl) {
 
     bool *visited = mem_calloc(n, sizeof(bool));
     size_t *queue = mem_calloc(n, sizeof(size_t));
-    if(!visited || !queue) {free(visited);free(queue);dl->failed=true;return;}
+    DotAdjacency adj;
+    if(!visited || !queue || !dot_adjacency_build(g,&adj)) {free(visited);free(queue);dl->failed=true;return;}
     size_t head = 0, tail = 0;
 
     visited[(size_t)start] = true;
@@ -158,17 +160,15 @@ static void rule_reachability(const DotGraph *g, DiagnosticList *dl) {
     /* BFS */
     while (head < tail) {
         size_t cur = queue[head++];
-        for(size_t e=0;e<g->edge_count;e++) {
-            if(!str_eq(g->edges[e].from,g->nodes[cur].id)) continue;
-            /* Find target node index */
-            for (size_t j = 0; j < n; j++) {
-                if (str_eq(g->nodes[j].id, g->edges[e].to) && !visited[j]) {
-                    visited[j] = true;
-                    queue[tail++] = j;
-                }
+        for (size_t k = adj.offset[cur]; k < adj.offset[cur + 1]; k++) {
+            size_t j = adj.target[k];
+            if (j != SIZE_MAX && !visited[j]) {
+                visited[j] = true;
+                queue[tail++] = j;
             }
         }
     }
+    dot_adjacency_free(&adj);
 
     for (size_t i = 0; i < n; i++) {
         if (!visited[i]) {

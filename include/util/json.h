@@ -27,11 +27,14 @@ struct JsonValue {
         struct {
             JsonValue **items;
             size_t      count;
+            size_t      cap;
         } array;
         struct {
             char      **keys;
             JsonValue **values;
             size_t      count;
+            size_t      cap;
+            struct StrIndex *index; /* key lookup, built once an object grows */
         } object;
     };
 };

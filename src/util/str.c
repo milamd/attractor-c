@@ -155,6 +155,19 @@ char *str_lower(char *s) {
     return s;
 }
 
+size_t str_utf8_prefix(const char *s, size_t max) {
+    if (!s) return 0;
+    size_t n = strnlen(s, max);
+    if (n < max || !s[n]) return n;
+    /* Back up over continuation bytes to the start of the cut sequence. */
+    size_t start = n;
+    while (start > 0 && ((unsigned char)s[start - 1] & 0xc0) == 0x80 && n - start < 3) start--;
+    if (start == 0) return n;
+    unsigned char lead = (unsigned char)s[start - 1];
+    size_t need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+    return n - (start - 1) >= need ? n : start - 1;
+}
+
 size_t str_split(const char *s, char delim, char ***out) {
     if (!s) { *out = NULL; return 0; }
     size_t count = 1;

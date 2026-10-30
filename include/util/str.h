@@ -35,6 +35,8 @@ bool    str_contains(const char *haystack, const char *needle);
 bool    str_icontains(const char *haystack, const char *needle);
 char   *str_trim(char *s);
 char   *str_lower(char *s);
+/* Longest prefix of at most max bytes that does not split a UTF-8 sequence. */
+size_t  str_utf8_prefix(const char *s, size_t max);
 size_t  str_split(const char *s, char delim, char ***out);
 void    str_split_free(char **parts, size_t count);
 

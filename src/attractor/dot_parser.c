@@ -9,6 +9,8 @@
 #include "util/str.h"
 #include "util/mem.h"
 #include "util/io.h"
+#include "util/strindex.h"
+#include <stdint.h>
 #include <errno.h>
 #include <limits.h>
 
@@ -16,6 +18,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+
+/* Distinct attributes per element or attribute block; bounds per-statement work. */
+#define DOT_ATTR_LIMIT 1024u
 
 /*============================================================================
  * Token types
@@ -91,6 +96,7 @@ typedef struct {
     AttrList      graph_attrs;
     DefaultAttrs  node_defaults;
     DefaultAttrs  edge_defaults;
+    StrIndex      node_ids;
     char         *graph_name;
     char         *err;
     bool          failed;
@@ -362,24 +368,26 @@ static void defaultattrs_init(DefaultAttrs *d) {
     d->cap = 0;
 }
 
-static void defaultattrs_add(DefaultAttrs *d, const char *key, const char *value) {
+static bool defaultattrs_add(DefaultAttrs *d, const char *key, const char *value) {
     /* Overwrite existing if key already present */
     for (size_t i = 0; i < d->count; i++) {
         if (str_eq(d->items[i].key, key)) {
             free(d->items[i].value);
             d->items[i].value = str_dup(value);
-            return;
+            return true;
         }
     }
+    if (d->count >= DOT_ATTR_LIMIT) return false;
     if (d->count == d->cap) {
         size_t cap=d->cap?d->cap*2:8;
         Attr *items=mem_reallocarray(d->items,cap,sizeof(*items));
-        if(!items) return ;
+        if(!items) return false;
         d->items=items;d->cap=cap;
     }
     d->items[d->count].key   = str_dup(key);
     d->items[d->count].value = str_dup(value);
     d->count++;
+    return true;
 }
 
 static void defaultattrs_free(DefaultAttrs *d) {
@@ -477,6 +485,11 @@ static void parse_attr_block(Parser *p, AttrList *attrs) {
             free(key);
             return;
         }
+        if (attrs->count >= DOT_ATTR_LIMIT) {
+            parser_error(p, "DOT attribute limit exceeded");
+            free(key);
+            return;
+        }
         char *value = str_dup(p->cur.text);
         parser_advance(p);
 
@@ -496,13 +509,14 @@ static void parse_attr_block(Parser *p, AttrList *attrs) {
  *==========================================================================*/
 
 static DotNode *find_or_create_node(Parser *p, const char *id) {
-    for (size_t i = 0; i < p->nodes.count; i++) {
-        if (str_eq(p->nodes.items[i].id, id))
-            return &p->nodes.items[i];
-    }
+    size_t at;
+    if (strindex_get(&p->node_ids, id, &at))
+        return &p->nodes.items[at];
     DotNode *n = nodelist_add(&p->nodes);
     if(!n) {parser_error(p,"Node allocation failed");return NULL;}
     n->id = str_dup(id);
+    /* Node ids are separately allocated, so they stay valid as the array grows. */
+    if(!n->id || !strindex_put(&p->node_ids, n->id, p->nodes.count - 1)) {parser_error(p,"Node allocation failed");return NULL;}
     return n;
 }
 
@@ -510,15 +524,29 @@ static DotNode *find_or_create_node(Parser *p, const char *id) {
  * Parser – merge attrs into node (append, don't deduplicate yet)
  *==========================================================================*/
 
-static void merge_attrs_into_node(DotNode *n, const AttrList *al) {
+/* Later values replace earlier ones in place, so repeated statements cannot
+ * multiply attributes; lookups keep last-wins semantics. */
+static bool merge_attrs_into_node(DotNode *n, const AttrList *al) {
     for (size_t i = 0; i < al->count; i++) {
-        /* Grow node's attrs array */
+        Attr *existing = NULL;
+        for (size_t j = 0; j < n->attr_count && !existing; j++)
+            if (str_eq(n->attrs[j].key, al->items[i].key)) existing = &n->attrs[j];
+        if (existing) {
+            if (str_eq(existing->value, al->items[i].value)) continue;
+            char *value = str_dup(al->items[i].value);
+            if (!value) return false;
+            free(existing->value);
+            existing->value = value;
+            continue;
+        }
+        if (n->attr_count >= DOT_ATTR_LIMIT) return false;
         size_t idx = n->attr_count;
         Attr *items=mem_reallocarray(n->attrs,n->attr_count+1,sizeof(*items));
-        if(!items) return;n->attrs=items;n->attr_count++;
+        if(!items) return false;n->attrs=items;n->attr_count++;
         n->attrs[idx].key   = str_dup(al->items[i].key);
         n->attrs[idx].value = str_dup(al->items[i].value);
     }
+    return true;
 }
 
 /*============================================================================
@@ -645,13 +673,14 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
                 attrlist_init(&attrs);
                 parse_attr_block(p, &attrs);
                 for (size_t i = 0; i < attrs.count; i++) {
-                    defaultattrs_add(&local_nd, attrs.items[i].key,
-                                     attrs.items[i].value);
+                    bool ok = defaultattrs_add(&local_nd, attrs.items[i].key,
+                                               attrs.items[i].value);
                     /* Also update parser-global defaults when not in subgraph */
-                    if (!scope_node_defaults) {
-                        defaultattrs_add(&p->node_defaults, attrs.items[i].key,
-                                         attrs.items[i].value);
+                    if (ok && !scope_node_defaults) {
+                        ok = defaultattrs_add(&p->node_defaults, attrs.items[i].key,
+                                              attrs.items[i].value);
                     }
+                    if (!ok) { parser_error(p, "DOT attribute limit exceeded"); break; }
                 }
                 attrlist_free_contents(&attrs);
             }
@@ -667,8 +696,11 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
                 attrlist_init(&attrs);
                 parse_attr_block(p, &attrs);
                 for (size_t i = 0; i < attrs.count; i++)
-                    defaultattrs_add(&p->edge_defaults, attrs.items[i].key,
-                                     attrs.items[i].value);
+                    if (!defaultattrs_add(&p->edge_defaults, attrs.items[i].key,
+                                          attrs.items[i].value)) {
+                        parser_error(p, "DOT attribute limit exceeded");
+                        break;
+                    }
                 attrlist_free_contents(&attrs);
             }
             parser_skip_semi(p);
@@ -804,7 +836,8 @@ static void parse_statements(Parser *p, const DefaultAttrs *scope_node_defaults,
                 parse_attr_block(p, &combined);
 
             /* Merge into node */
-            merge_attrs_into_node(node, &combined);
+            if (!merge_attrs_into_node(node, &combined))
+                parser_error(p, "DOT attribute limit exceeded");
             attrlist_free_contents(&combined);
             free(first_id);
             parser_skip_semi(p);
@@ -993,6 +1026,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
     attrlist_init(&p.graph_attrs);
     defaultattrs_init(&p.node_defaults);
     defaultattrs_init(&p.edge_defaults);
+    strindex_init(&p.node_ids);
 
     /* Read first token */
     p.cur = lex_next(&p.lex);
@@ -1073,6 +1107,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
         attrlist_free_contents(&p.graph_attrs);
         defaultattrs_free(&p.node_defaults);
         defaultattrs_free(&p.edge_defaults);
+        strindex_free(&p.node_ids);
         free(p.graph_name);
         tok_free(&p.cur);
         free(p.lex.err);
@@ -1091,7 +1126,7 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
     DotGraph *g = mem_calloc(1, sizeof(DotGraph));
     if(!g) {
         DotGraph partial={.name=p.graph_name,.nodes=p.nodes.items,.node_count=p.nodes.count,.edges=p.edges.items,.edge_count=p.edges.count};
-        attrlist_free_contents(&p.graph_attrs);defaultattrs_free(&p.node_defaults);defaultattrs_free(&p.edge_defaults);tok_free(&p.cur);free(clean);
+        attrlist_free_contents(&p.graph_attrs);defaultattrs_free(&p.node_defaults);defaultattrs_free(&p.edge_defaults);strindex_free(&p.node_ids);tok_free(&p.cur);free(clean);
         /* Allocation-free graph destruction supports stack storage internally. */
         dot_graph_clear(&partial);return NULL;
     }
@@ -1100,6 +1135,9 @@ DotGraph *dot_parse(const char *source, char **err_msg) {
     g->node_count = p.nodes.count;
     g->edges      = p.edges.items;
     g->edge_count = p.edges.count;
+    g->node_index = mem_calloc(1, sizeof(*g->node_index));
+    if (g->node_index) *g->node_index = p.node_ids;
+    else strindex_free(&p.node_ids);
 
     resolve_graph_attrs(g, &p.graph_attrs);
 
@@ -1171,6 +1209,7 @@ static void dot_graph_clear(DotGraph *g) {
         free(e->thread_id);
     }
     free(g->edges);
+    if (g->node_index) { strindex_free(g->node_index); free(g->node_index); }
 
     memset(g,0,sizeof(*g));
 }
@@ -1182,6 +1221,10 @@ void dot_graph_free(DotGraph *g) {if(g) {dot_graph_clear(g);free(g);}}
 
 DotNode *dot_find_node(const DotGraph *g, const char *id) {
     if (!g || !id) return NULL;
+    if (g->node_index) {
+        size_t at;
+        return strindex_get(g->node_index, id, &at) && at < g->node_count ? &g->nodes[at] : NULL;
+    }
     for (size_t i = 0; i < g->node_count; i++) {
         if (str_eq(g->nodes[i].id, id))
             return &g->nodes[i];
@@ -1217,6 +1260,44 @@ size_t dot_incoming_edges(const DotGraph *g, const char *node_id,
             {if(out && found<max) out[found]=&g->edges[i];found++;}
     }
     return found;
+}
+
+bool dot_adjacency_build(const DotGraph *g, DotAdjacency *a) {
+    *a = (DotAdjacency){0};
+    size_t n = g->node_count, m = g->edge_count, slots;
+    size_t *source = mem_calloc(m, sizeof(*source)), *cursor = NULL;
+    if (!size_add(n, 1, &slots)) { free(source); return false; }
+    a->offset = mem_calloc(slots, sizeof(*a->offset));
+    a->edge = mem_calloc(m, sizeof(*a->edge));
+    a->target = mem_calloc(m, sizeof(*a->target));
+    cursor = mem_calloc(slots, sizeof(*cursor));
+    if (!source || !a->offset || !a->edge || !a->target || !cursor) goto fail;
+    for (size_t k = 0; k < m; k++) {
+        const DotNode *from = dot_find_node(g, g->edges[k].from);
+        source[k] = from ? (size_t)(from - g->nodes) : SIZE_MAX;
+        if (from) a->offset[source[k] + 1]++;
+    }
+    for (size_t i = 0; i < n; i++) a->offset[i + 1] += a->offset[i];
+    memcpy(cursor, a->offset, slots * sizeof(*cursor));
+    /* Stable counting sort keeps each node's edges in declaration order. */
+    for (size_t k = 0; k < m; k++) {
+        if (source[k] == SIZE_MAX) continue;
+        size_t at = cursor[source[k]]++;
+        const DotNode *to = dot_find_node(g, g->edges[k].to);
+        a->edge[at] = k;
+        a->target[at] = to ? (size_t)(to - g->nodes) : SIZE_MAX;
+    }
+    free(source); free(cursor);
+    return true;
+fail:
+    free(source); free(cursor); dot_adjacency_free(a);
+    return false;
+}
+
+void dot_adjacency_free(DotAdjacency *a) {
+    if (!a) return;
+    free(a->offset); free(a->edge); free(a->target);
+    *a = (DotAdjacency){0};
 }
 
 /*============================================================================

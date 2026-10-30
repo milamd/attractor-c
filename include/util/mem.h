@@ -11,4 +11,6 @@ void *mem_reallocarray(void *old, size_t count, size_t size);
 /* Test-only, per-thread: -1 disables; 0 fails next and subsequent allocations. */
 void mem_fail_after(long successful_allocations);
 unsigned long mem_failure_count(void);
+/* Overwrites secrets in a way the optimizer cannot elide. */
+void mem_wipe(void *p, size_t size);
 #endif
