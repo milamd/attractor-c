@@ -964,7 +964,7 @@ static void resolve_edge(DotEdge *e) {
  *==========================================================================*/
 
 static void resolve_graph_attrs(DotGraph *g, const AttrList *ga) {
-    g->default_max_retry = 50; /* default */
+    g->default_max_retry = 0; /* spec default: no retries */
 
     for (size_t i = 0; i < ga->count; i++) {
         const char *k = ga->items[i].key;
@@ -979,8 +979,8 @@ static void resolve_graph_attrs(DotGraph *g, const AttrList *ga) {
         } else if (str_eq(k, "model_stylesheet")) {
             free(g->model_stylesheet);
             g->model_stylesheet = str_dup(v);
-        } else if (str_eq(k, "default_max_retry")) {
-            g->default_max_retry = parse_int(v, 50);
+        } else if (str_eq(k, "default_max_retries") || str_eq(k, "default_max_retry")) {
+            g->default_max_retry = parse_int(v, 0); /* legacy singular key accepted */
         } else if (str_eq(k, "retry_target")) {
             free(g->retry_target);
             g->retry_target = str_dup(v);

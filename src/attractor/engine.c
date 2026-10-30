@@ -46,6 +46,7 @@ static Outcome execute_with_retry(PipelineRunner *runner, Handler *handler,
 
 static Outcome execute_graph(PipelineRunner *r,Checkpoint *cp,const char *boundary);
 static bool initial_checkpoint(PipelineRunner *r,Checkpoint *cp,const char *start,const PipelineContext *context);
+static void apply_transforms(const PipelineRunner *r,DotGraph *g);
 static char *graph_identity(const DotGraph *g);
 static Outcome fail_outcome(const char *reason);
 
@@ -325,6 +326,7 @@ bool checkpoint_save(const Checkpoint *cp,const char *path) {
     JsonValue *j=json_new_object();json_object_set(j,"version",json_new_number(2));
     json_object_set(j,"graph_identity",json_new_string(cp->graph_identity));json_object_set(j,"run_id",json_new_string(cp->run_id));
     json_object_set(j,"next_node",json_new_string(str_safe(cp->next_node)));json_object_set(j,"pending_node",json_new_string(str_safe(cp->pending_node)));
+    json_object_set(j,"current_node",json_new_string(str_safe(cp->current_node)));json_object_set(j,"completed_nodes",cp->completed_nodes?json_copy(cp->completed_nodes):json_new_array());
     json_object_set(j,"complete",json_new_bool(cp->complete));json_object_set(j,"final_outcome",outcome_json(&cp->final_outcome));
     JsonValue *context=json_new_object(),*logs=json_new_array();
     for(size_t i=0;i<cp->context.count;i++) json_object_set(context,cp->context.keys[i],json_new_string(cp->context.values[i]));
@@ -348,10 +350,14 @@ bool checkpoint_load(Checkpoint *cp,const char *path) {
     Checkpoint temporary={.version=2};
     JsonValue *history=json_get(j,"history"),*latest=json_get(j,"latest"),*context=json_get(j,"context"),*logs=json_get(j,"logs");
     const char *identity=json_get_string(j,"graph_identity"),*run=json_get_string(j,"run_id"),*next=json_get_string(j,"next_node"),*pending=json_get_string(j,"pending_node");
-    JsonValue *complete=json_get(j,"complete");
+    JsonValue *complete=json_get(j,"complete"),*completed=json_get(j,"completed_nodes");
+    const char *current=json_get(j,"current_node")?json_get_string(j,"current_node"):"";
+    if(!completed) completed=&(JsonValue){.type=JSON_ARRAY}; /* absent in checkpoints written before these fields */
     if(json_get_int(j,"version",0)!=2 || !identity || !*identity || !run || !*run || !next || !pending || !complete || complete->type!=JSON_BOOL ||
        !history || history->type!=JSON_ARRAY || history->array.count>10000 || !latest || latest->type!=JSON_OBJECT || latest->object.count>10000 ||
-       !context || context->type!=JSON_OBJECT || !logs || logs->type!=JSON_ARRAY || logs->array.count>10000) goto fail;
+       !context || context->type!=JSON_OBJECT || !logs || logs->type!=JSON_ARRAY || logs->array.count>10000 ||
+       !current || completed->type!=JSON_ARRAY || completed->array.count>10000) goto fail;
+    for(size_t i=0;i<completed->array.count;i++) if(completed->array.items[i]->type!=JSON_STRING) goto fail;
     uuid_t run_uuid;if(uuid_parse(run,run_uuid)!=0) goto fail;
     if(*pending && !str_eq(pending,next)) goto fail;
     temporary.graph_identity=str_dup(identity);temporary.run_id=str_dup(run);temporary.next_node=str_dup(next);temporary.pending_node=str_dup(pending);temporary.complete=complete->boolean;
@@ -365,15 +371,15 @@ bool checkpoint_load(Checkpoint *cp,const char *path) {
     for(size_t i=0;i<latest->object.count;i++) {Outcome o={0};if(!outcome_from_json(&o,latest->object.values[i])) goto fail;outcome_free(&o);}
     for(size_t i=0;i<context->object.count;i++) {JsonValue *v=context->object.values[i];if(v->type!=JSON_STRING) goto fail;ctx_set(&temporary.context,context->object.keys[i],v->string);}
     for(size_t i=0;i<logs->array.count;i++) {JsonValue *v=logs->array.items[i];if(v->type!=JSON_STRING) goto fail;ctx_append_log(&temporary.context,v->string);}
-    temporary.history=json_copy(history);temporary.latest=json_copy(latest);
-    if(temporary.context.failed || !temporary.history || !temporary.latest) goto fail;
+    temporary.history=json_copy(history);temporary.latest=json_copy(latest);temporary.completed_nodes=json_copy(completed);temporary.current_node=str_dup(current);
+    if(temporary.context.failed || !temporary.history || !temporary.latest || !temporary.completed_nodes || !temporary.current_node) goto fail;
     checkpoint_free(cp);*cp=temporary;json_free(j);return true;
 fail:checkpoint_free(&temporary);json_free(j);return false;
 }
 void checkpoint_free(Checkpoint *cp) {
     if(!cp) return;
-    free(cp->graph_identity);free(cp->run_id);free(cp->next_node);free(cp->pending_node);
-    outcome_free(&cp->final_outcome);json_free(cp->history);json_free(cp->latest);ctx_free(&cp->context);memset(cp,0,sizeof(*cp));
+    free(cp->graph_identity);free(cp->run_id);free(cp->next_node);free(cp->pending_node);free(cp->current_node);
+    outcome_free(&cp->final_outcome);json_free(cp->history);json_free(cp->latest);json_free(cp->completed_nodes);ctx_free(&cp->context);memset(cp,0,sizeof(*cp));
 }
 
 /* ── 4. Condition Evaluator ──────────────────────────────────────────── */
@@ -447,10 +453,17 @@ void handler_registry_register(HandlerRegistry *reg, const char *type,
     reg->handlers[reg->count++] = h;
 }
 
-Handler *handler_registry_resolve(const HandlerRegistry *reg,const DotNode *node) {
-    const char *role=dot_node_role(node);
-    for(size_t i=0;i<reg->count;i++) if(str_eq(reg->handlers[i]->type_name,role)) return reg->handlers[i];
+static Handler *handler_registry_find(const HandlerRegistry *reg,const char *type) {
+    for(size_t i=0;i<reg->count;i++) if(str_eq(reg->handlers[i]->type_name,type)) return reg->handlers[i];
     return NULL;
+}
+/* Spec 4.2: the explicit type, then the shape's handler, then codergen. */
+Handler *handler_registry_resolve(const HandlerRegistry *reg,const DotNode *node) {
+    Handler *h=node->type && *node->type?handler_registry_find(reg,node->type):NULL;
+    if(h) return h;
+    DotNode by_shape=*node;by_shape.type=NULL;
+    h=handler_registry_find(reg,dot_node_role(&by_shape));
+    return h?h:handler_registry_find(reg,"codergen");
 }
 
 /* ── 6. Built-in Handlers ────────────────────────────────────────────── */
@@ -515,7 +528,7 @@ static char *expand_goal(const char *input, const char *goal)
 }
 
 /* Write spec-compliant status.json per Appendix C:
- * { "outcome": "...", "preferred_next_label": "...",
+ * { "outcome": "...", "preferred_label": "...",
  *   "suggested_next_ids": [...], "context_updates": {...}, "notes": "..." } */
 static bool write_outcome_status(const char *logs_root, const char *node_id,
                                  const Outcome *o)
@@ -527,7 +540,7 @@ static bool write_outcome_status(const char *logs_root, const char *node_id,
                     json_new_string(status_to_string(o->status)));
 
     if (o->preferred_label)
-        json_object_set(root, "preferred_next_label",
+        json_object_set(root, "preferred_label",
                         json_new_string(o->preferred_label));
 
     if (o->suggested_next_count > 0) {
@@ -557,6 +570,43 @@ static bool write_outcome_status(const char *logs_root, const char *node_id,
 
     bool ok=json_str && io_artifact_write(logs_root,node_id,"status.json",json_str);
     free(json_str);return ok;
+}
+
+/* Merge an Appendix C status.json into `o`. When it has context_updates
+ * (string values only), the parsed document is returned through `doc` for the
+ * caller to read and free. False when the file is malformed. */
+static bool apply_status_file(Outcome *o, const char *text, JsonValue **doc)
+{
+    JsonValue *j = json_parse(text, NULL);
+    const char *outcome = json_get_string(j, "outcome");
+    JsonValue *label = json_get(j, "preferred_label"), *ids = json_get(j, "suggested_next_ids");
+    JsonValue *notes = json_get(j, "notes"), *reason = json_get(j, "failure_reason"), *ctx = json_get(j, "context_updates");
+    bool valid = j && j->type == JSON_OBJECT && outcome &&
+        (str_eq(outcome, "success") || str_eq(outcome, "fail") || str_eq(outcome, "retry") ||
+         str_eq(outcome, "partial_success") || str_eq(outcome, "skipped")) &&
+        (!label || label->type == JSON_STRING) && (!notes || notes->type == JSON_STRING) &&
+        (!reason || reason->type == JSON_STRING) && (!ids || ids->type == JSON_ARRAY) &&
+        (!ctx || ctx->type == JSON_OBJECT);
+    for (size_t i = 0; valid && ids && i < ids->array.count; i++) valid = ids->array.items[i]->type == JSON_STRING;
+    for (size_t i = 0; valid && ctx && i < ctx->object.count; i++) valid = ctx->object.values[i]->type == JSON_STRING;
+    if (!valid) { json_free(j); return false; }
+
+    o->status = string_to_status(outcome);
+    if (label && *label->string) { free(o->preferred_label); o->preferred_label = str_dup(label->string); }
+    if (notes) { free(o->notes); o->notes = str_dup(notes->string); }
+    if (reason) { free(o->failure_reason); o->failure_reason = str_dup(reason->string); }
+    if (ids && ids->array.count) {
+        char **list = mem_calloc(ids->array.count, sizeof(*list));
+        if (list) {
+            for (size_t i = 0; i < o->suggested_next_count; i++) free(o->suggested_next_ids[i]);
+            free(o->suggested_next_ids);
+            for (size_t i = 0; i < ids->array.count; i++) list[i] = str_dup(ids->array.items[i]->string);
+            o->suggested_next_ids = list; o->suggested_next_count = ids->array.count;
+        }
+    }
+    if (ctx) *doc = j;
+    else json_free(j);
+    return true;
 }
 
 static Outcome codergen_handler(const DotNode *node, PipelineContext *ctx,
@@ -593,14 +643,33 @@ static Outcome codergen_handler(const DotNode *node, PipelineContext *ctx,
         free(prompt);return (Outcome){.status=STAGE_FAIL,.failure_reason=str_dup("Cannot write contained prompt artifact")};
     }
 
+    /* status.json in the stage directory is the agent's outcome channel
+     * (Appendix C); remove any file left by an earlier attempt first. */
+    char *artifact = io_artifact_name(node->id);
+    StrBuf dir_buf; strbuf_init(&dir_buf);
+    if (artifact) strbuf_appendf(&dir_buf, "%s/%s", logs_root, artifact);
+    free(artifact);
+    char *stage_dir = strbuf_detach(&dir_buf);
+    char *status_path = NULL;
+    if (stage_dir) { StrBuf sp; strbuf_init(&sp); strbuf_appendf(&sp, "%s/status.json", stage_dir); status_path = strbuf_detach(&sp); }
+    if (!stage_dir || !status_path || (unlink(status_path) != 0 && errno != ENOENT)) {
+        free(stage_dir); free(status_path); free(prompt);
+        return fail_outcome("Cannot prepare stage status file");
+    }
+
     /* Execute via backend or simulate */
     char *response = NULL;
     if (runner && runner->backend) {
-        response = runner->backend->run(runner->backend, node, prompt, ctx);
+        response = runner->backend->run(runner->backend, node, prompt, ctx, stage_dir, &o);
+        { /* context updates are handler-owned; discard any the backend set */
+            Outcome ignored = {.update_keys=o.update_keys, .update_values=o.update_values, .update_count=o.update_count};
+            outcome_free(&ignored); o.update_keys = o.update_values = NULL; o.update_count = 0;
+        }
+        if (o.status > STAGE_SKIPPED) o.status = STAGE_FAIL;
         if (!response) {
             o.status = STAGE_FAIL;
-            o.failure_reason = str_dup("Backend returned NULL response");
-            free(prompt);
+            if (!o.failure_reason) o.failure_reason = str_dup("Backend returned NULL response");
+            free(prompt); free(stage_dir); free(status_path);
             return o;
         }
     } else {
@@ -611,21 +680,43 @@ static Outcome codergen_handler(const DotNode *node, PipelineContext *ctx,
         response = strbuf_detach(&sim);
     }
 
+    free(stage_dir);
     if(!response || strnlen(response,ATTRACTOR_OUTPUT_LIMIT+1)>ATTRACTOR_OUTPUT_LIMIT || !io_artifact_write(logs_root,node->id,"response.md",response)) {
-        free(response);free(prompt);return (Outcome){.status=STAGE_FAIL,.failure_reason=str_dup("Cannot write response artifact")};
+        outcome_free(&o);free(response);free(prompt);free(status_path);return (Outcome){.status=STAGE_FAIL,.failure_reason=str_dup("Cannot write response artifact")};
     }
 
-    /* Build outcome */
-    o.status = STAGE_SUCCESS;
+    /* Apply an agent-written status.json; without one the stage succeeds. */
+    JsonValue *status_doc = NULL;
+    char *status_text = io_read_text(status_path, 1 << 20);
+    free(status_path);
+    if (status_text) {
+        bool applied = apply_status_file(&o, status_text, &status_doc);
+        free(status_text);
+        if (!applied) {
+            outcome_free(&o); free(response); free(prompt);
+            return fail_outcome("Invalid status.json written by stage");
+        }
+    } else if (node->auto_status && !o.notes) {
+        o.notes = str_dup("auto-status: handler completed without writing status");
+    }
 
     /* Context updates: last_stage, last_response, and per-node full response.
      * last_response is capped at 16 KB for checkpoint size sanity.
      * response.<node_id> carries the full text (capped at 64 KB) so
      * downstream nodes can access any predecessor's complete output. */
-    o.update_keys   = mem_calloc(3, sizeof(char *));
-    o.update_values = mem_calloc(3, sizeof(char *));
-    if(!o.update_keys || !o.update_values) {outcome_free(&o);free(response);free(prompt);return fail_outcome("Outcome allocation failed");}
+    const JsonValue *status_updates = json_get(status_doc, "context_updates");
+    size_t extra = status_updates ? status_updates->object.count : 0;
+    o.update_keys   = mem_calloc(3 + extra, sizeof(char *));
+    o.update_values = mem_calloc(3 + extra, sizeof(char *));
+    if(!o.update_keys || !o.update_values) {json_free(status_doc);outcome_free(&o);free(response);free(prompt);return fail_outcome("Outcome allocation failed");}
     o.update_count=3;
+    for (size_t i = 0; i < extra; i++) {
+        const char *key = status_updates->object.keys[i];
+        if (str_starts_with(key, "internal.")) continue;
+        o.update_keys[o.update_count] = str_dup(key);
+        o.update_values[o.update_count++] = str_dup(status_updates->object.values[i]->string);
+    }
+    json_free(status_doc);
     o.update_keys[0]   = str_dup("last_stage");
     o.update_values[0] = str_dup(str_safe(node->id));
     o.update_keys[1]   = str_dup("last_response");
@@ -838,28 +929,16 @@ static PipelineRunner *inherited_runner(PipelineRunner *parent,DotGraph *graph,c
         handler_registry_register(&child->handler_reg,h->type_name,h->execute,h->data==parent?child:h->data);
     }return child;
 }
-static bool merge_branch(PipelineContext *parent,const PipelineContext *base,const PipelineContext *branch,PipelineContext *merged,const char *scope,const char *id) {
-    for(size_t i=0;i<branch->count;i++) {
-        const char *key=branch->keys[i],*value=branch->values[i];
-        if(str_starts_with(key,"internal.") || str_eq(key,"outcome") || str_eq(key,"current_node") || str_eq(key,"preferred_label") || str_eq(key,"last_stage") || str_eq(key,"last_response") || str_eq(key,"parallel.results") || str_starts_with(key,"parallel.fan_in.")) continue;
-        if(str_eq(ctx_get(base,key,NULL),value)) continue;
-        StrBuf b;strbuf_init(&b);strbuf_appendf(&b,"%s.%s.%s",scope,id,key);char *name=strbuf_detach(&b);
-        if(!name) return false;ctx_set(parent,name,value);free(name);
-        const char *prior=ctx_get(merged,key,NULL);
-        if(prior && !str_eq(prior,value)) return false;
-        ctx_set(merged,key,value);
-    }return !parent->failed && !merged->failed;
-}
 static Outcome parallel_handler(const DotNode *node,PipelineContext *ctx,const DotGraph *graph,const char *logs_root,void *data) {
     PipelineRunner *r=data;if(!r || r->child_depth>=r->max_child_depth) return fail_outcome("Branch depth budget exhausted");
     char *error=NULL;const DotNode *join=dot_parallel_join(graph,node,&error);
     if(!join) {Outcome fail=fail_outcome(error?error:"Invalid parallel region");free(error);return fail;}
     PipelineContext *base=ctx_clone(ctx);if(!base) return fail_outcome("Cannot isolate branch context");
-    PipelineContext merged={0};JsonValue *results=json_new_array();size_t successes=0,failures=0,total=0;
+    JsonValue *results=json_new_array();size_t successes=0,failures=0,total=0;
     const char *policy=dot_node_attr(node,"error_policy","fail_fast"),*join_policy=dot_node_attr(node,"join_policy","wait_all");
     size_t instance=r->active_checkpoint?r->active_checkpoint->history->array.count:0;
     StrBuf scope_buf;strbuf_init(&scope_buf);strbuf_appendf(&scope_buf,"parallel.%s.%zu",r->active_checkpoint?r->active_checkpoint->run_id:node->id,instance);
-    char *scope=strbuf_detach(&scope_buf),*fork_name=io_artifact_name(node->id);bool conflict=false;
+    char *scope=strbuf_detach(&scope_buf),*fork_name=io_artifact_name(node->id);bool failed=false;
     if(!scope || !fork_name || !results) {free(scope);free(fork_name);ctx_free(base);free(base);json_free(results);return fail_outcome("Cannot initialize fork");}
     for(size_t i=0;i<graph->edge_count;i++) if(str_eq(graph->edges[i].from,node->id)) total++;
     for(size_t i=0;i<graph->edge_count;i++) {
@@ -878,8 +957,8 @@ static Outcome parallel_handler(const DotNode *node,PipelineContext *ctx,const D
             bool compatible=loaded && identity && str_eq(cp.graph_identity,identity);free(identity);
             if(exists && (!compatible || !recoverable)) {outcome_free(&branch);branch=fail_outcome("Ambiguous or corrupt branch checkpoint");}
             else if(loaded || initial_checkpoint(child,&cp,edge->to,base)) {
+                /* Spec 3.8: the branch context stays isolated; only its outcome is collected. */
                 outcome_free(&branch);branch=execute_graph(child,&cp,join->id);
-                if(!merge_branch(ctx,base,&cp.context,&merged,scope,edge->to)) conflict=true;
                 if(r->active_checkpoint) {
                     for(size_t h=0;h<cp.history->array.count;h++) json_array_push(r->active_checkpoint->history,json_copy(cp.history->array.items[h]));
                     for(size_t k=0;k<cp.latest->object.count;k++) json_object_set(r->active_checkpoint->latest,cp.latest->object.keys[k],json_copy(cp.latest->object.values[k]));
@@ -889,15 +968,14 @@ static Outcome parallel_handler(const DotNode *node,PipelineContext *ctx,const D
         JsonValue *record=outcome_json(&branch);json_object_set(record,"outcome",json_new_string(status_to_string(branch.status)));json_object_set(record,"node_id",json_new_string(edge->to));json_array_push(results,record);
         if(branch.status==STAGE_SUCCESS || branch.status==STAGE_PARTIAL_SUCCESS) successes++;else failures++;
         checkpoint_free(&cp);pipeline_runner_free(child);free(logs);outcome_free(&branch);
-        if(conflict || (failures && str_eq(policy,"fail_fast")) || (successes && str_eq(join_policy,"first_success"))) break;
+        if((failures && str_eq(policy,"fail_fast")) || (successes && str_eq(join_policy,"first_success"))) break;
     }
     char *encoded=json_serialize(results);json_free(results);
-    if(encoded) {ctx_set(ctx,scope,encoded);ctx_set(ctx,"parallel.results",encoded);}else conflict=true;
+    if(encoded) {ctx_set(ctx,scope,encoded);ctx_set(ctx,"parallel.results",encoded);}else failed=true;
     free(encoded);free(scope);free(fork_name);ctx_free(base);free(base);
-    if(!conflict) for(size_t i=0;i<merged.count;i++) ctx_set(ctx,merged.keys[i],merged.values[i]);ctx_free(&merged);
     bool accepted=str_eq(join_policy,"first_success")?successes>0:str_eq(join_policy,"quorum")?successes>total/2:failures==0 && successes==total;
-    Outcome o={.status=accepted && !conflict?STAGE_SUCCESS:STAGE_FAIL};
-    if(o.status==STAGE_FAIL) o.failure_reason=str_dup(conflict?"Conflicting branch context updates":"Parallel join policy unsatisfied");
+    Outcome o={.status=accepted && !failed?STAGE_SUCCESS:STAGE_FAIL};
+    if(o.status==STAGE_FAIL) o.failure_reason=str_dup(failed?"Cannot record parallel results":"Parallel join policy unsatisfied");
     else {
         o.suggested_next_ids=mem_calloc(1,sizeof(char *));if(!o.suggested_next_ids) return fail_outcome("Cannot select join");
         o.suggested_next_ids[0]=str_dup(join->id);o.suggested_next_count=1;
@@ -979,7 +1057,7 @@ static Outcome manager_loop_handler(const DotNode *node,PipelineContext *ctx,con
     for(long cycle=0;cycle<cycles;cycle++) {
         char *err=NULL;DotGraph *child_graph=dot_parse(source,&err);
         if(!child_graph) {outcome_free(&result);result=fail_outcome(err?err:"Invalid child DOT");free(err);break;}
-        transform_expand_variables(child_graph);transform_apply_stylesheet(child_graph);
+        transform_expand_variables(child_graph);transform_apply_stylesheet(child_graph);apply_transforms(parent,child_graph);
         if(!validate_or_raise_with_handlers(child_graph,registered_type,parent,&err)) {outcome_free(&result);result=fail_outcome(err?err:"Invalid child graph");free(err);dot_graph_free(child_graph);break;}
         size_t instance=parent->active_checkpoint?parent->active_checkpoint->history->array.count:0;
         StrBuf path;strbuf_init(&path);strbuf_appendf(&path,"%s/%s/attempt-%s-%zu/cycle-%ld",logs_root,component,parent->active_checkpoint?parent->active_checkpoint->run_id:"direct",instance,cycle);
@@ -1136,7 +1214,7 @@ PipelineRunner *pipeline_runner_new(DotGraph *graph, const char *logs_root)
 {
     PipelineRunner *r = mem_calloc(1, sizeof(PipelineRunner));
     if(!r) return NULL;
-    r->max_iterations=10000;r->max_child_depth=8;r->owns_interviewer=true;
+    r->max_iterations=10000;r->max_child_depth=8;r->max_restarts=100;r->owns_interviewer=true;
     r->graph    = graph;
     r->logs_root = str_dup(logs_root ? logs_root : "./logs");
     if(!r->logs_root) {free(r);return NULL;}
@@ -1147,6 +1225,8 @@ PipelineRunner *pipeline_runner_new(DotGraph *graph, const char *logs_root)
 void pipeline_runner_free(PipelineRunner *r)
 {
     if (!r) return;
+    free(r->restart_node);
+    free(r->transforms);
     handler_registry_free(&r->handler_reg);
     free(r->logs_root);
     if (r->interviewer && r->owns_interviewer)
@@ -1268,6 +1348,8 @@ static Outcome execute_graph(PipelineRunner *r,Checkpoint *cp,const char *bounda
         ctx_apply_updates(&cp->context,&step);ctx_set(&cp->context,"outcome",status_to_string(step.status));
         ctx_set(&cp->context,"current_node",node->id);ctx_set(&cp->context,"preferred_label",str_safe(step.preferred_label));
         json_object_set(cp->latest,node->id,outcome_json(&step));
+        free(cp->current_node);cp->current_node=str_dup(node->id);if(!cp->current_node) cp->context.failed=true;
+        if(cp->completed_nodes->array.count<10000) json_array_push(cp->completed_nodes,json_new_string(node->id));else cp->completed_nodes->failed=true;
         StrBuf log;strbuf_init(&log);strbuf_appendf(&log,"[%s] status=%s",node->id,status_to_string(step.status));char *entry=strbuf_detach(&log);
         if(entry) ctx_append_log(&cp->context,entry);else cp->context.failed=true;free(entry);
         if(!write_outcome_status(r->logs_root,node->id,&step)) {outcome_free(&step);outcome_free(&result);result=fail_outcome("Cannot write contained status artifact");break;}
@@ -1288,8 +1370,15 @@ static Outcome execute_graph(PipelineRunner *r,Checkpoint *cp,const char *bounda
             next=node->retry_target;if(!next || !*next) next=node->fallback_retry_target;
             if(!next || !*next) next=NULL;
         }
-        if(cp->context.failed || !cp->history || cp->history->failed || !cp->latest || cp->latest->failed) {
+        if(cp->context.failed || !cp->history || cp->history->failed || !cp->latest || cp->latest->failed || cp->completed_nodes->failed) {
             outcome_free(&step);outcome_free(&result);result=fail_outcome("Allocation or history/context budget exhausted");break;
+        }
+        /* loop_restart ends this run; the caller starts a fresh one at the target. */
+        bool restart=edge && edge->loop_restart && !boundary;
+        if(restart) {
+            free(r->restart_node);r->restart_node=str_dup(edge->to);
+            if(!r->restart_node) {outcome_free(&step);outcome_free(&result);result=fail_outcome("Restart allocation failed");break;}
+            next=NULL;
         }
         char *owned_next=next?str_dup(next):NULL;
         if(next && !owned_next) {outcome_free(&step);outcome_free(&result);result=fail_outcome("Transition allocation failed");break;}
@@ -1297,7 +1386,8 @@ static Outcome execute_graph(PipelineRunner *r,Checkpoint *cp,const char *bounda
         free(cp->pending_node);cp->pending_node=NULL;
         if(!next) {
             outcome_free(&result);
-            if(denied_human && step.status==STAGE_SUCCESS) result=fail_outcome("Human selection no longer has an eligible transition");
+            if(restart) result=(Outcome){.status=STAGE_SUCCESS};
+            else if(denied_human && step.status==STAGE_SUCCESS) result=fail_outcome("Human selection no longer has an eligible transition");
             else if(terminal || step.status==STAGE_FAIL || denied_human) result=outcome_copy(&step);
             else result=fail_outcome("No eligible transition from nonterminal stage");
             cp->complete=true;outcome_free(&cp->final_outcome);cp->final_outcome=outcome_copy(&result);
@@ -1318,37 +1408,73 @@ static Outcome execute_graph(PipelineRunner *r,Checkpoint *cp,const char *bounda
     r->active_checkpoint=NULL;
     return result;
 }
+bool pipeline_runner_register_transform(PipelineRunner *r,GraphTransformFn fn,void *userdata) {
+    if(!r || !fn) return false;
+    GraphTransform *items=r->transform_count<1024?mem_reallocarray(r->transforms,r->transform_count+1,sizeof(*items)):NULL;
+    if(!items) {r->transforms_failed=true;return false;}
+    r->transforms=items;items[r->transform_count++]=(GraphTransform){fn,userdata};return true;
+}
+static void apply_transforms(const PipelineRunner *r,DotGraph *g) {
+    for(size_t i=0;i<r->transform_count;i++) r->transforms[i].fn(g,r->transforms[i].userdata);
+}
+/* Custom transforms run once per runner graph, before validation. */
+static bool prepare_graph(PipelineRunner *r) {
+    if(r->transforms_failed) return false;
+    if(!r->transforms_applied) {apply_transforms(r,r->graph);r->transforms_applied=true;}
+    return true;
+}
 static bool initial_checkpoint(PipelineRunner *r,Checkpoint *cp,const char *start,const PipelineContext *context) {
     *cp=(Checkpoint){.version=2,.final_outcome={.status=STAGE_FAIL}};
     cp->graph_identity=graph_identity(r->graph);cp->next_node=str_dup(start);
     uuid_t u;uuid_generate(u);char id[37];uuid_unparse_lower(u,id);cp->run_id=str_dup(id);
-    cp->history=json_new_array();cp->latest=json_new_object();
+    cp->history=json_new_array();cp->latest=json_new_object();cp->completed_nodes=json_new_array();cp->current_node=str_dup("");
     if(context) for(size_t i=0;i<context->count;i++) ctx_set(&cp->context,context->keys[i],context->values[i]);
     if(r->graph->goal) ctx_set(&cp->context,"graph.goal",r->graph->goal);
-    return cp->graph_identity && cp->next_node && cp->run_id && cp->history && cp->latest && !cp->context.failed;
+    return cp->graph_identity && cp->next_node && cp->run_id && cp->history && cp->latest && cp->completed_nodes && cp->current_node && !cp->context.failed;
+}
+/* Spec 3.2 step 7: each loop_restart re-launches at the edge target with a
+ * fresh context and log directory <logs_root>/restart-<n>. */
+static Outcome run_restarts(PipelineRunner *r,Outcome result) {
+    char *root=r->logs_root;
+    for(unsigned n=1;r->restart_node && n<=r->max_restarts;n++) {
+        char *start=r->restart_node;r->restart_node=NULL;outcome_free(&result);
+        StrBuf b;strbuf_init(&b);strbuf_appendf(&b,"%s/restart-%u",root,n);char *logs=strbuf_detach(&b);
+        Checkpoint cp={0};
+        if(logs) {
+            r->logs_root=logs;
+            if(initial_checkpoint(r,&cp,start,NULL)) {emit_event(r,PIPE_EVT_PIPELINE_STARTED,start,"restarted",0);result=execute_graph(r,&cp,NULL);}
+            else result=fail_outcome("Cannot initialize restarted run");
+            r->logs_root=root;
+        } else result=fail_outcome("Restart allocation failed");
+        checkpoint_free(&cp);free(logs);free(start);
+    }
+    if(r->restart_node) {free(r->restart_node);r->restart_node=NULL;outcome_free(&result);result=fail_outcome("Restart budget exhausted");}
+    return result;
 }
 Outcome pipeline_run(PipelineRunner *r) {
-    if(!r || !r->graph || r->handler_reg.failed) return fail_outcome("Runner, graph, or handler registry invalid");
+    if(!r || !r->graph || r->handler_reg.failed || !prepare_graph(r)) return fail_outcome("Runner, graph, handler registry, or transforms invalid");
     if(!validate_or_raise_with_handlers(r->graph,registered_type,r,NULL)) return fail_outcome("Graph validation failed");
     const char *start=NULL;for(size_t i=0;i<r->graph->node_count;i++) if(str_eq(dot_node_role(&r->graph->nodes[i]),"start")) {start=r->graph->nodes[i].id;break;}
     if(!start) return fail_outcome("Missing start node");
     Checkpoint cp={0};if(!initial_checkpoint(r,&cp,start,NULL)) {checkpoint_free(&cp);return fail_outcome("Cannot initialize execution state");}
-    emit_event(r,PIPE_EVT_PIPELINE_STARTED,start,NULL,0);Outcome result=execute_graph(r,&cp,NULL);checkpoint_free(&cp);return result;
+    emit_event(r,PIPE_EVT_PIPELINE_STARTED,start,NULL,0);Outcome result=execute_graph(r,&cp,NULL);checkpoint_free(&cp);return run_restarts(r,result);
 }
 Outcome pipeline_resume(PipelineRunner *r,const char *path) {
-    if(!r || !r->graph || r->handler_reg.failed || !validate_or_raise_with_handlers(r->graph,registered_type,r,NULL)) return fail_outcome("Invalid runner/graph");
+    if(!r || !r->graph || r->handler_reg.failed || !prepare_graph(r) || !validate_or_raise_with_handlers(r->graph,registered_type,r,NULL)) return fail_outcome("Invalid runner/graph");
     Checkpoint cp={0};if(!checkpoint_load(&cp,path)) return fail_outcome("Invalid checkpoint: version 2 required; legacy state cannot safely reconstruct routing");
     char *identity=graph_identity(r->graph);bool valid=identity && str_eq(identity,cp.graph_identity);free(identity);
     if(cp.next_node && *cp.next_node && !dot_find_node(r->graph,cp.next_node)) valid=false;
     for(size_t i=0;i<cp.latest->object.count;i++) if(!dot_find_node(r->graph,cp.latest->object.keys[i])) valid=false;
     for(size_t i=0;i<cp.history->array.count;i++) if(!dot_find_node(r->graph,json_get_string(cp.history->array.items[i],"node_id"))) valid=false;
+    for(size_t i=0;i<cp.completed_nodes->array.count;i++) if(!dot_find_node(r->graph,cp.completed_nodes->array.items[i]->string)) valid=false;
+    if(*cp.current_node && !dot_find_node(r->graph,cp.current_node)) valid=false;
     if(!valid) {checkpoint_free(&cp);return fail_outcome("Checkpoint graph identity/node mismatch");}
     if(cp.pending_node && *cp.pending_node) {
         const DotNode *pending=dot_find_node(r->graph,cp.pending_node);
         const char *role=pending?dot_node_role(pending):"";
         if(!str_eq(role,"parallel") && !str_eq(role,"stack.manager_loop")) {checkpoint_free(&cp);return fail_outcome("Interrupted stage has ambiguous effects; inspect attempt and explicitly reconcile before retrying");}
     }
-    emit_event(r,PIPE_EVT_PIPELINE_STARTED,cp.next_node,"resumed",0);Outcome result=execute_graph(r,&cp,NULL);checkpoint_free(&cp);return result;
+    emit_event(r,PIPE_EVT_PIPELINE_STARTED,cp.next_node,"resumed",0);Outcome result=execute_graph(r,&cp,NULL);checkpoint_free(&cp);return run_restarts(r,result);
 }
 
 /* ── 14. Transforms ──────────────────────────────────────────────────── */
@@ -1388,7 +1514,7 @@ void transform_apply_stylesheet(DotGraph *g)
 /* Parse a stylesheet source.
  * Format:
  *   selector { prop: value; prop: value; }
- * Selectors: "*", ".classname", "#nodeid"
+ * Selectors (specificity): "*" (0), shape name (1), ".classname" (2), "#nodeid" (3)
  */
 Stylesheet *stylesheet_parse(const char *src,char **err) {
     if(err) *err=NULL;
@@ -1400,8 +1526,11 @@ Stylesheet *stylesheet_parse(const char *src,char **err) {
         const char *start=p;while(*p && !isspace((unsigned char)*p) && *p!='{') p++;
         if(p==start) goto fail;rule.selector=str_ndup(start,(size_t)(p-start));if(!rule.selector) goto fail;
         if(str_eq(rule.selector,"*")) rule.specificity=0;
-        else if((rule.selector[0]=='.' || rule.selector[0]=='#') && rule.selector[1]) rule.specificity=rule.selector[0]=='#'?2:1;
-        else goto fail;
+        else if((rule.selector[0]=='.' || rule.selector[0]=='#') && rule.selector[1]) rule.specificity=rule.selector[0]=='#'?3:2;
+        else {
+            for(const char *c=rule.selector;*c;c++) if(!isalnum((unsigned char)*c) && *c!='_') goto fail;
+            rule.specificity=1;
+        }
         while(isspace((unsigned char)*p)) p++;if(*p!='{') goto fail;p++;
         for(;;) {
             while(isspace((unsigned char)*p)) p++;if(*p=='}') {p++;break;}if(!*p) goto fail;
@@ -1442,34 +1571,55 @@ void stylesheet_free(Stylesheet *s)
     free(s);
 }
 
-/* Check whether a rule's selector matches a given node. */
-static bool selector_matches(const char *selector, const DotNode *node)
+/* True when the comma-separated class list contains `name` (whitespace-trimmed). */
+static bool class_list_contains(const char *list, const char *name)
 {
-    if (!selector) return false;
-    if (str_eq(selector, "*")) return true;
-    if (selector[0] == '#') {
-        /* Match node id */
-        return str_eq(selector + 1, str_safe(node->id));
-    }
-    if (selector[0] == '.') {
-        /* Match node class_attr */
-        if (!node->class_attr) return false;
-        return str_eq(selector + 1, node->class_attr);
+    size_t name_len = strlen(name);
+    for (const char *p = list; *p; ) {
+        while (*p == ',' || isspace((unsigned char)*p)) p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+        if ((size_t)(end - start) == name_len && !strncmp(start, name, name_len)) return true;
     }
     return false;
 }
 
+/* Check whether a rule's selector matches a given node. */
+static bool selector_matches(const StyleRule *rule, const DotNode *node)
+{
+    const char *selector = rule->selector;
+    if (!selector) return false;
+    switch (rule->specificity) {
+    case 0: return true;
+    case 1: return node->shape && str_eq(selector, node->shape);
+    case 2: return node->class_attr && class_list_contains(node->class_attr, selector + 1);
+    case 3: return str_eq(selector + 1, str_safe(node->id));
+    default: return false;
+    }
+}
+
+/* Highest specificity wins; later rules win ties. One pass over the rules per
+ * node, copying each property at most once. */
+static void apply_style_value(char **field, const char *value) {
+    char *copy = str_dup(value);
+    if (copy) { free(*field); *field = copy; }
+}
 void stylesheet_apply(const Stylesheet *s,DotGraph *g) {
     if(!s || !g) return;
     for(size_t i=0;i<g->node_count;i++) {
         DotNode *node=&g->nodes[i];
-        bool explicit_model=node->llm_model && *node->llm_model,explicit_provider=node->llm_provider && *node->llm_provider,explicit_effort=node->reasoning_effort && *node->reasoning_effort;
-        for(int specificity=0;specificity<3;specificity++) for(size_t k=0;k<s->count;k++) {
-            const StyleRule *r=&s->rules[k];if(r->specificity!=specificity || !selector_matches(r->selector,node)) continue;
-            if(r->llm_model && !explicit_model) {char *copy=str_dup(r->llm_model);if(copy) {free(node->llm_model);node->llm_model=copy;}}
-            if(r->llm_provider && !explicit_provider) {char *copy=str_dup(r->llm_provider);if(copy) {free(node->llm_provider);node->llm_provider=copy;}}
-            if(r->reasoning_effort && !explicit_effort) {char *copy=str_dup(r->reasoning_effort);if(copy) {free(node->reasoning_effort);node->reasoning_effort=copy;}}
+        const StyleRule *model=NULL,*provider=NULL,*effort=NULL;
+        for(size_t k=0;k<s->count;k++) {
+            const StyleRule *r=&s->rules[k];if(!selector_matches(r,node)) continue;
+            if(r->llm_model && (!model || r->specificity>=model->specificity)) model=r;
+            if(r->llm_provider && (!provider || r->specificity>=provider->specificity)) provider=r;
+            if(r->reasoning_effort && (!effort || r->specificity>=effort->specificity)) effort=r;
         }
+        if(model && !(node->llm_model && *node->llm_model)) apply_style_value(&node->llm_model,model->llm_model);
+        if(provider && !(node->llm_provider && *node->llm_provider)) apply_style_value(&node->llm_provider,provider->llm_provider);
+        if(effort && !(node->reasoning_effort && *node->reasoning_effort)) apply_style_value(&node->reasoning_effort,effort->reasoning_effort);
     }
 }
 
@@ -1603,11 +1753,77 @@ Interviewer *console_interviewer_new(void)
     return iv;
 }
 
+/* --- Callback and queue interviewers --- */
+
+typedef struct {
+    InterviewerCallback cb;
+    void *userdata;
+} CallbackInterviewer;
+
+static Answer callback_ask(Interviewer *self, const Question *q)
+{
+    CallbackInterviewer *c = self->impl;
+    return c->cb(q, c->userdata);
+}
+
+static void impl_cleanup(Interviewer *self) { free(self->impl); }
+
+Interviewer *callback_interviewer_new(InterviewerCallback cb, void *userdata)
+{
+    if (!cb) return NULL;
+    Interviewer *iv = mem_calloc(1, sizeof(Interviewer));
+    CallbackInterviewer *c = mem_calloc(1, sizeof(*c));
+    if (!iv || !c) { free(iv); free(c); return NULL; }
+    c->cb = cb; c->userdata = userdata;
+    iv->impl = c; iv->ask = callback_ask; iv->cleanup = impl_cleanup;
+    return iv;
+}
+
+typedef struct {
+    char **answers;
+    size_t count;
+    size_t next;
+} QueueInterviewer;
+
+static Answer queue_ask(Interviewer *self, const Question *q)
+{
+    (void)q;
+    QueueInterviewer *queue = self->impl;
+    Answer a = {.kind = ANSWER_SKIPPED, .option_index = -1};
+    if (queue->next < queue->count) {
+        const char *value = queue->answers[queue->next++];
+        a.value = str_dup(value); a.text = str_dup(value);
+        a.kind = a.value && a.text ? ANSWER_SELECTION : ANSWER_INVALID;
+    }
+    return a;
+}
+
+static void queue_cleanup(Interviewer *self)
+{
+    QueueInterviewer *queue = self->impl;
+    for (size_t i = 0; i < queue->count; i++) free(queue->answers[i]);
+    free(queue->answers); free(queue);
+}
+
+Interviewer *queue_interviewer_new(const char *const *answers, size_t count)
+{
+    if ((count && !answers) || count > 10000) return NULL;
+    Interviewer *iv = mem_calloc(1, sizeof(Interviewer));
+    QueueInterviewer *queue = mem_calloc(1, sizeof(*queue));
+    char **copies = mem_calloc(count ? count : 1, sizeof(char *));
+    if (!iv || !queue || !copies) { free(iv); free(queue); free(copies); return NULL; }
+    iv->impl = queue; iv->ask = queue_ask; iv->cleanup = queue_cleanup;
+    queue->answers = copies;
+    for (; queue->count < count; queue->count++) {
+        if (!answers[queue->count] || !(copies[queue->count] = str_dup(answers[queue->count]))) { interviewer_free(iv); return NULL; }
+    }
+    return iv;
+}
+
 void interviewer_free(Interviewer *iv)
 {
     if (!iv) return;
-    /* If impl was dynamically allocated, the creator would need a custom free.
-       For our built-in interviewers, impl is NULL, so just free the struct. */
+    if (iv->cleanup) iv->cleanup(iv);
     free(iv);
 }
 
