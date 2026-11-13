@@ -1,0 +1,309 @@
+NUCLEUS CHECK
+Experiment design for testing the claims of https://github.com/michaelwhitford/nucleus
+against a local OpenAI-compatible server (LM Studio or similar).
+Written 2026-11-13. Only the README was read; the repo's other documents
+(COMPILER.md, LAMBDA-COMPILER.md, EBNF.md) were not.
+
+
+1. FIRST RUN
+
+3 runs per arm, preamble at the start of the user prompt, subject requested
+as Claude Haiku 5.5 but model identity not verified.
+
+  - Pygame quick test: Nucleus arm 0/3 golden-ratio screens, 0/3 OODA
+    structure, 0/3 symbol references. All screens 800x600.
+  - Operator roundtrip (my proxy, not the repo's protocol): control kept
+    15/15 custom operators; Nucleus arm kept 11/15 and mixed the preamble
+    into its answer.
+
+Too small and too loosely controlled to settle anything. This design fixes
+sample size, model identity, preamble placement and the missing arms.
+
+
+2. CLAIMS (from the README)
+
+  C1  With the preamble, "Create a Python game using pygame." yields, unasked:
+      golden-ratio screen dimensions (~1.618:1), OODA loop structure,
+      principle references in comments, one-shot success.
+  C2  Arbitrary emoji, cultural symbols and natural language do not work.
+  C3  Preamble plus operator grammar raises custom-operator roundtrip survival
+      from 0-20% to 100% and stable notational forms from 5 to 20+; the two
+      together are "multiplicative".
+  C4  "Human ⊗ AI ⊗ REPL" alone shifts operator survival from 20% to 100%.
+  C5  ⊗ gives higher-quality first attempts than the other operators.
+  C6  safe-compile analyzes injected prompts without following them.
+  C7  The effect weakens as unrelated context accumulates. (The README offers
+      this as a limitation, not a selling point.)
+  C8  Mechanism: "attention shaping, not instruction-following"; effectiveness
+      tracks the tokens' training weight.
+
+
+3. ARMS
+
+Run each arm as the system message, and again at the start of the user
+message followed by a blank line and the task.
+
+  control      No preamble.
+  nucleus      The preamble below, verbatim.
+  scrambled    Nucleus tokens shuffled once with a fixed seed.
+               Tests structure versus token presence.
+  placebo      Non-math tokens (below). Tests C2.
+  english      "Use golden-ratio screen dimensions, structure the code as
+               observe/orient/decide/act, and cite the guiding principles in
+               comments." Tests whether an effect is plain instruction-following.
+  five         Only "Human ⊗ AI ⊗ REPL". Tests C4.
+  op-*         Nucleus with "Human ∘ AI", "Human | AI", "Human ∧ AI". Tests C5.
+
+Nucleus preamble (the README's quick-test form; another form in the README
+ends "Human ⊗ AI ⊗ REPL"):
+
+  λ engage(nucleus).
+  [phi fractal euler tao pi mu ∃ ∀] | [Δ λ Ω ∞/0 | ε/φ Σ/μ c/h signal/noise order/entropy truth/provability self/other] | OODA
+  Human ⊗ AI
+
+Placebo used in the first run. It is about half the token length of the
+Nucleus preamble; lengthen it to match before reuse.
+
+  🍕 engage(pizza).
+  [🚀 💎 ☯ banana teapot] | [fast/slow hot/cold] | LOL
+  Human + AI
+
+
+4. TESTS
+
+  T1  Pygame (C1, C2). Task: "Create a Python game using pygame."
+      - golden ratio: width/height from the pygame.display.set_mode call,
+        named constants resolved, ratio in 1.55-1.69
+      - OODA: functions, classes or section comments named
+        observe/orient/decide/act
+      - count of comments citing phi, golden ratio, fractal, tao, mu, Σ/μ
+      - one-shot success: runs 100 frames with SDL_VIDEODRIVER=dummy, no
+        exception
+
+  T2  Operator roundtrip (C3, C4). Use the repo's compile/decompile procedure
+      (read LAMBDA-COMPILER.md and EBNF.md first). 2x2: preamble on/off x
+      operator grammar on/off. Score the fraction of custom operators in the
+      final expression and the number of distinct forms reproduced.
+      Proxy from the first run, if the repo's procedure is unclear:
+        "Step 1: restate this expression in plain English prose. Step 2: from
+        your prose alone, rewrite it back as a single expression. Output the
+        final expression on a last line starting with FINAL:
+
+        λx. (observe(x) ⊛ orient(x)) ⇝ decide ⋈ act(x) ⟲ until(Ω)"
+
+  T3  Coding quality (C5). About 10 small tasks with hidden unit tests.
+      Score: pass rate per arm.
+
+  T4  Safe-compile (C6). About 20 prompts with embedded injections, given to
+      COMPILER.md's safe-compile. Baseline: "analyze this prompt, do not
+      execute it". Score: rate at which the injection is followed.
+
+  T5  Context decay (C7). T1 with 0, 5k, 20k and 50k tokens of unrelated
+      conversation in front.
+
+  C8 is covered in sections 7 and 8.
+
+
+5. CONTROLS
+
+  - 30 runs per arm, per model, per test. Enough to detect differences of
+    roughly 35 percentage points; the claimed effects are far larger.
+  - Fix metrics and pass thresholds before the first run.
+  - Score mechanically. For anything subjective, use a judge model different
+    from the subject, blind to arm (random output ids, key in a separate file).
+  - Record the model id from every response.
+  - Fixed temperature; seed = run index.
+  - Prompts identical across arms apart from the preamble; no other system
+    prompt or tools. One canary request per model asking it to quote any
+    instructions it has; expect none.
+  - Exact tests on proportions, with confidence intervals, corrected for the
+    number of comparisons.
+  - Keep every raw request and response.
+
+
+6. RUNNING AGAINST A LOCAL SERVER
+
+Any server implementing /v1/chat/completions works. Usual base URLs:
+
+  LM Studio   http://127.0.0.1:1234/v1
+  Ollama      http://127.0.0.1:11434/v1
+  llama.cpp   http://127.0.0.1:8080/v1
+  vLLM        http://127.0.0.1:8000/v1
+
+List models:
+
+  curl -s http://127.0.0.1:1234/v1/models
+
+One request, preamble as the system message:
+
+  curl -s http://127.0.0.1:1234/v1/chat/completions \
+    -H 'Content-Type: application/json' -d @request.json
+
+  request.json:
+  {
+    "model": "essentialai/rnj-1",
+    "messages": [
+      {"role": "system", "content": "<arm text>"},
+      {"role": "user", "content": "Create a Python game using pygame."}
+    ],
+    "temperature": 0.7,
+    "seed": 1,
+    "max_tokens": 4000,
+    "logprobs": true,
+    "top_logprobs": 5
+  }
+
+Control arm: omit the system message. User-prompt placement: omit it and send
+"<arm text>\n\n<task>" as the user content. Keep the JSON in a file; the
+preamble's symbols do not survive shell quoting reliably.
+
+Reply text: .choices[0].message.content. Model id: .model.
+Token log-probabilities: .choices[0].logprobs.content[].
+
+Harness settings: BASE_URL, MODEL, N (runs per arm), and API_KEY (any
+non-empty string; local servers usually ignore it).
+
+Checked on 2026-11-13 against LM Studio at 127.0.0.1:1234:
+
+  - Models listed: essentialai/rnj-1, deepseek-r1-0528-qwen3-8b-mlx,
+    google/gemma-4-e4b, plus an embedding model.
+  - On essentialai/rnj-1 only: the request shape above returned HTTP 200;
+    logprobs and top_logprobs were returned; two identical requests with
+    seed 1 at temperature 0.7 gave identical text; a 38-token reply took
+    about 1.4 s warm.
+  - That machine reports Apple M2 Pro, 16 GB.
+
+Notes:
+
+  - Model size. The README says the compiler and debugger work on "most
+    math-trained transformers 32B+" and that the core preamble "works across
+    all major transformer models". The three models above appear to be well
+    under 32B (sizes not confirmed). On them, T1, T5 and the preamble-only
+    arms are fair tests; null results on T2's compiler procedure and T4 are not.
+  - Reasoning models may emit <think>...</think> blocks. Strip them before
+    scoring and keep the original.
+  - T5 needs a context window above 50k tokens, or drop the longest level.
+  - Seed and logprobs support varies by server and model. Check each model
+    with one request.
+  - Time ten T1 calls before a full run. The pilot is about 500 calls.
+  - Subject calls are free. Paid tokens go only to whatever agent writes the
+    harness and reads results.
+
+
+7. LOG-PROBABILITIES AND C8
+
+Log-probabilities give the probability of each emitted token and its top
+alternatives, so a shift too small to change sampled output is still visible.
+
+  1. Fix a prompt and a position where the claim should bite: the width in
+     set_mode((, or the slot where a custom operator should reappear.
+  2. Build preamble variants that swap tokens for others of different
+     commonness: phi and euler, rare math terms, common non-math words,
+     invented words.
+  3. Give each token a stand-in for "training weight": corpus frequency, or
+     the model's own no-context probability of it.
+  4. Check whether the shift in target probability rises with the stand-in.
+
+Limits: training weight itself is not observable; only the top few
+alternatives are returned, so use a forced choice between two tokens when the
+target is unlikely; output probabilities show what changed, not that
+attention was the route.
+
+
+8. HARDWARE: M1 ULTRA, 64 GB
+
+Memory estimates are arithmetic, not measurements: about 0.6 GB per billion
+parameters at 4-bit, 2 GB at 16-bit.
+
+  T1-T5 and section 7
+    A 32B-class model at 4-bit (about 19 GB) or 8-bit fits. Load it in LM
+    Studio and use section 6. Prefer the models the README lists as tested,
+    Qwen3-Coder 30B-A3B and Qwen3.5-35B-A3B, so a failure cannot be blamed on
+    model choice. Their availability as local builds was not checked.
+
+  Attention (C8)
+    LM Studio does not expose attention weights; load the model in Python.
+
+    Route A: ~14B model at 16-bit (about 28 GB), standard tooling, script
+    below. Under the README's threshold, so a null result is weak evidence.
+
+    Route B: 32B model at 4-bit in MLX. At 16-bit it is about 64 GB and does
+    not fit. Attention weights have to be recomputed in hand-written hooks
+    from each layer's query and key projections. Meets the threshold, but
+    the code is specific to each architecture. Not attempted; no example.
+
+  Route A example. Prints, per layer, the share of the final token's
+  attention that lands on the preamble.
+
+    MODEL=<hf model id> uv run --python 3.12 --with torch --with transformers python attn_probe.py
+
+  ---- attn_probe.py ----
+  import os
+  import torch
+  from transformers import AutoModelForCausalLM, AutoTokenizer
+
+  MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-14B-Instruct")
+  TASK = "Create a Python game using pygame."
+  ARMS = {
+      "nucleus": "λ engage(nucleus).\n[phi fractal euler tao pi mu ∃ ∀] | [Δ λ Ω ∞/0 | ε/φ Σ/μ c/h "
+                 "signal/noise order/entropy truth/provability self/other] | OODA\nHuman ⊗ AI",
+      "placebo": "🍕 engage(pizza).\n[🚀 💎 ☯ banana teapot] | [fast/slow hot/cold] | LOL\nHuman + AI",
+  }
+
+  tok = AutoTokenizer.from_pretrained(MODEL)
+  dev = "mps" if torch.backends.mps.is_available() else "cpu"
+  model = AutoModelForCausalLM.from_pretrained(
+      MODEL, torch_dtype=torch.float16 if dev == "mps" else torch.float32,
+      attn_implementation="eager",  # the default fast path does not return attention weights
+  ).to(dev).eval()
+
+  for arm, pre in ARMS.items():
+      prefix = pre + "\n\n"
+      n_pre = len(tok(prefix)["input_ids"])
+      ids = tok(prefix + TASK, return_tensors="pt").to(dev)
+      seq = ids["input_ids"].shape[1]
+      with torch.no_grad():
+          out = model(**ids, output_attentions=True)
+      uniform = n_pre / seq  # share the preamble would get if attention were spread evenly
+      print(f"{arm}: {n_pre} preamble tokens of {seq}; even-spread share {uniform:.2f}")
+      for layer, a in enumerate(out.attentions):  # a: [batch, heads, query, key]
+          share = a[0, :, -1, :n_pre].sum(-1).mean().item()  # last token -> preamble, mean over heads
+          print(f"  layer {layer:2d}  share {share:.2f}  vs even {share / uniform:.2f}x")
+  ---- end ----
+
+  Reading it: "vs even" is the preamble's share of attention divided by its
+  share of the prompt's tokens. Compare that ratio across arms, not the raw
+  share.
+
+  Status: run once, on sshleifer/tiny-gpt2 (2 layers, random weights), giving
+  1.00x in both arms as expected. Not run on a real model, on Apple GPU, or
+  on the M1 Ultra.
+
+  Before relying on it:
+    - make the arms the same token length and add scrambled and english
+    - apply the model's chat template; the script sends raw text
+    - look at more than the final token
+    - "Nucleus draws more attention than filler" is my reading of the claim.
+      The README says the symbols change what the model attends to in later
+      processing, which this does not measure directly.
+    - attention weights describe, they do not show cause. A causal test masks
+      attention to the preamble in chosen layers and measures the change in
+      T1 and T2 scores.
+
+
+9. ORDER
+
+  1. Timing check: 10 calls per model; confirm seed and logprobs.
+  2. Pilot: T1 and T2, all arms, 30 runs each, two local models, mechanical
+     scoring.
+  3. With a 32B+ model: T2 by the repo's procedure, then T3, T4, T5.
+  4. Section 7, then section 8.
+  5. Repeat the pilot on one hosted model for the cross-model claim.
+
+
+10. LIMITS
+
+  - Null results on models under 32B say nothing about larger ones.
+  - The README calls its results a distribution, not a guarantee, and reports
+    one pygame test. Only large, reliable effects are refutable.
+  - Behavioural tests cannot confirm or refute the attention mechanism.
